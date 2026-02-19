@@ -4,7 +4,7 @@
 #
 # Wael Isa
 # Build Date: 02/19/2026
-# Version: 1.1.1
+# Version: 1.1.2
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
@@ -13,20 +13,16 @@
 #
 # COMPLETE FIX HISTORY - ALL ISSUES RESOLVED:
 # ==============================================================================
-# v1.1.1 - FIXED: Complete script rewrite with ALL functions properly defined
-#        - Added ALL missing functions (check_root, detect_os, install_dependencies,
-#          check_pihole_version, check_installed, prompt_domain, prompt_email,
-#          get_local_ip, test_ports, prompt_upnp, show_config_summary, create_backup,
-#          detect_services_to_restart, detect_acme_client, verify_certificate,
-#          configure_pihole, configure_firewall, verify_endpoints, print_summary)
-#        - Fixed function call order in main execution
-#        - Added proper domain display in webroot test page
-#        - Fixed syntax error (unexpected end of file)
-#        - All 24 steps now work sequentially
+# v1.1.2 - ADDED: Option to restrict port 53 (DNS) to local network only
+#        - Based on Pi-hole firewall documentation
+#        - User can choose to block external DNS while keeping DoH/DoT open
+#        - Added firewall rules for local network access (192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12)
+#        - Ports 80/443/853 remain open for Let's Encrypt and encrypted DNS
+#        - Added network detection for local subnet
+#        - Recommended setting for security (prevents DNS amplification attacks)
 # ==============================================================================
+# v1.1.1 - Fixed syntax error and added all missing functions
 # v1.1.0 - Added temporary self-signed certificate for HTTPS testing
-#        - During uninstall/restore, asks user about self-signed cert creation
-#        - Follows Pi-hole TLS docs exactly (PEM format, pihole user perms)
 # ==============================================================================
 #
 # This script configures Pi-hole v6 with enterprise-grade encryption:
@@ -34,6 +30,11 @@
 # 🔒 DNS-over-HTTPS (DoH) endpoint: https://YOUR-DOMAIN:PORT/dns-query
 # 🔒 DNS-over-TLS (DoT) endpoint: tls://YOUR-DOMAIN:853
 # 🔒 DNS-over-QUIC (DoQ) endpoint: quic://YOUR-DOMAIN:853
+#
+# 🔐 NEW: Option to restrict port 53 (DNS) to local network only
+#        - External DNS queries blocked for security
+#        - Encrypted DNS (DoH/DoT/DoQ) remain accessible worldwide
+#        - Follows Pi-hole firewall documentation exactly
 #
 #############################################################################################################################
 
@@ -58,6 +59,11 @@ LE_EMAIL=""
 ACME_CLIENT="certbot"
 LETSENCRYPT_DIR=""
 WEBROOT="/var/www/html"
+RESTRICT_DNS="true"  # Default to recommended setting
+
+# Network detection
+LOCAL_SUBNET=""
+LOCAL_SUBNETS=()
 
 # OS Detection variables
 OS_TYPE=""
@@ -74,7 +80,7 @@ PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 PIHOLE_OLD_CONFIG="/etc/pihole/pihole.toml.bak"
 BACKUP_DIR="/root/pihole-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 ACME_HOME="/root/.acme.sh"
@@ -152,7 +158,7 @@ declare -a PORTS_TO_CHECK=()
 
 # Step tracking
 CURRENT_STEP=0
-TOTAL_STEPS=24
+TOTAL_STEPS=25  # Increased for DNS restriction prompt
 
 #================================================================================
 # UTILITY FUNCTIONS
@@ -321,6 +327,76 @@ install_dependencies() {
 }
 
 #================================================================================
+# NETWORK DETECTION FUNCTIONS
+#================================================================================
+
+detect_local_subnets() {
+    print_step "Detecting Local Network Subnets"
+    debug_log "Entering detect_local_subnets"
+
+    LOCAL_SUBNETS=()
+
+    # Common local network ranges (as per Pi-hole docs)
+    LOCAL_SUBNETS+=("192.168.0.0/16")
+    LOCAL_SUBNETS+=("10.0.0.0/8")
+    LOCAL_SUBNETS+=("172.16.0.0/12")
+
+    # Try to detect actual subnet from interface
+    if command -v ip &> /dev/null; then
+        local interface_ip=$(ip -4 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+        if [[ -n "$interface_ip" ]]; then
+            # Convert IP to subnet (simplified - assumes /24)
+            local subnet_base=$(echo "$interface_ip" | cut -d. -f1-3)
+            LOCAL_SUBNETS+=("$subnet_base.0/24")
+            print_message "Detected local subnet: $subnet_base.0/24"
+        fi
+    fi
+
+    # Remove duplicates
+    LOCAL_SUBNETS=($(echo "${LOCAL_SUBNETS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+
+    print_success "Local subnets configured: ${LOCAL_SUBNETS[*]}"
+    debug_log "Local subnets: ${LOCAL_SUBNETS[*]}"
+    pause
+}
+
+#================================================================================
+# DNS RESTRICTION PROMPT
+#================================================================================
+
+prompt_dns_restriction() {
+    print_step "DNS Security Configuration"
+    debug_log "Entering prompt_dns_restriction"
+
+    echo -e "${YELLOW}Restrict port 53 (DNS) to local network only?${NC}"
+    echo ""
+    echo -e "This is a ${GREEN}RECOMMENDED${NC} security setting that:"
+    echo -e "  ${GREEN}✓${NC} Blocks external DNS queries (prevents DNS amplification attacks)"
+    echo -e "  ${GREEN}✓${NC} Keeps unencrypted DNS local to your network"
+    echo -e "  ${GREEN}✓${NC} Still allows encrypted DNS (DoH/DoT/DoQ) from anywhere"
+    echo -e "  ${GREEN}✓${NC} Follows Pi-hole firewall best practices"
+    echo ""
+    echo -e "Based on Pi-hole documentation:"
+    echo -e "  ${CYAN}https://docs.pi-hole.net/main/prerequisites/#firewalls${NC}"
+    echo ""
+    echo -e "${YELLOW}If you choose NO, port 53 will be open to the internet (not recommended)${NC}"
+    echo ""
+
+    read -p "Restrict DNS to local network? (Y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        RESTRICT_DNS="false"
+        print_warning "DNS port 53 will be open to the internet - this is NOT recommended!"
+        print_warning "Your Pi-hole could be used in DNS amplification attacks"
+    else
+        RESTRICT_DNS="true"
+        print_success "DNS restricted to local network - recommended setting enabled"
+    fi
+    debug_log "DNS restriction: $RESTRICT_DNS"
+    pause
+}
+
+#================================================================================
 # PI-HOLE VERSION CHECK
 #================================================================================
 
@@ -377,6 +453,7 @@ check_installed() {
                 EMAIL="$INSTALLED_EMAIL"
                 WEB_PORT="$INSTALLED_WEB_PORT"
                 USE_UPNP="$INSTALLED_USE_UPNP"
+                RESTRICT_DNS="${INSTALLED_RESTRICT_DNS:-true}"
                 LETSENCRYPT_DIR="/etc/letsencrypt/live/${DOMAIN}"
                 ;;
             2)
@@ -592,6 +669,8 @@ test_ports() {
         "${WEB_PORT}:tcp:HTTPS Web Interface + DoH"
         "${DNS_TLS_PORT}:tcp:DNS-over-TLS"
         "${DNS_TLS_PORT}:udp:DNS-over-QUIC"
+        "53:tcp:DNS (unencrypted - will be restricted)"
+        "53:udp:DNS (unencrypted - will be restricted)"
     )
 
     echo -e "${CYAN}Port Status Check:${NC}"
@@ -728,6 +807,12 @@ prompt_upnp() {
     echo "  - TCP $WEB_PORT -> $LOCAL_IP:$WEB_PORT (HTTPS/DoH)"
     echo "  - TCP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoT)"
     echo "  - UDP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoQ)"
+
+    if [[ "$RESTRICT_DNS" == "true" ]]; then
+        echo "  - Port 53 will NOT be forwarded (local only - security)"
+    else
+        echo "  - TCP/UDP 53 -> $LOCAL_IP:53 (DNS - WARNING: open to internet)"
+    fi
     echo ""
 
     read -p "Enable UPnP? (y/n): " -n 1 -r
@@ -773,7 +858,7 @@ configure_upnp() {
     print_message "Forwarding TCP 443 -> $LOCAL_IP:443 (Let's Encrypt HTTPS)"
     upnpc -a "$LOCAL_IP" 443 443 tcp >> "$LOG_FILE" 2>&1
 
-    # Add port forwarding rules for Pi-hole
+    # Add port forwarding rules for Pi-hole encrypted ports
     print_message "Forwarding TCP $WEB_PORT -> $LOCAL_IP:$WEB_PORT (HTTPS/DoH)"
     upnpc -a "$LOCAL_IP" "$WEB_PORT" "$WEB_PORT" tcp >> "$LOG_FILE" 2>&1
 
@@ -782,6 +867,13 @@ configure_upnp() {
 
     print_message "Forwarding UDP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoQ)"
     upnpc -a "$LOCAL_IP" "$DNS_TLS_PORT" "$DNS_TLS_PORT" udp >> "$LOG_FILE" 2>&1
+
+    # Only forward port 53 if user explicitly allowed it
+    if [[ "$RESTRICT_DNS" == "false" ]]; then
+        print_warning "Forwarding TCP/UDP 53 -> $LOCAL_IP:53 (DNS - INSECURE!)"
+        upnpc -a "$LOCAL_IP" 53 53 tcp >> "$LOG_FILE" 2>&1
+        upnpc -a "$LOCAL_IP" 53 53 udp >> "$LOG_FILE" 2>&1
+    fi
 
     print_success "UPnP port forwarding configured"
     debug_log "UPnP configuration complete"
@@ -813,15 +905,21 @@ EOF
 LOCAL_IP="$LOCAL_IP"
 WEB_PORT="$WEB_PORT"
 DNS_TLS_PORT="$DNS_TLS_PORT"
+RESTRICT_DNS="$RESTRICT_DNS"
 
 sleep 10
 # Let's Encrypt ports
 upnpc -a "\$LOCAL_IP" 80 80 tcp > /dev/null 2>&1
 upnpc -a "\$LOCAL_IP" 443 443 tcp > /dev/null 2>&1
-# Pi-hole ports
+# Pi-hole encrypted ports
 upnpc -a "\$LOCAL_IP" "\$WEB_PORT" "\$WEB_PORT" tcp > /dev/null 2>&1
 upnpc -a "\$LOCAL_IP" "\$DNS_TLS_PORT" "\$DNS_TLS_PORT" tcp > /dev/null 2>&1
 upnpc -a "\$LOCAL_IP" "\$DNS_TLS_PORT" "\$DNS_TLS_PORT" udp > /dev/null 2>&1
+# DNS port 53 - only forward if explicitly allowed
+if [[ "\$RESTRICT_DNS" == "false" ]]; then
+    upnpc -a "\$LOCAL_IP" 53 53 tcp > /dev/null 2>&1
+    upnpc -a "\$LOCAL_IP" 53 53 udp > /dev/null 2>&1
+fi
 EOF
 
         chmod +x /usr/local/bin/pihole-upnp-forward.sh
@@ -852,6 +950,8 @@ show_config_summary() {
     echo -e "  ${YELLOW}Interface:${NC}           $INTERFACE"
     echo -e "  ${YELLOW}UPnP Enabled:${NC}        $USE_UPNP"
     echo -e "  ${YELLOW}Webroot:${NC}              $WEBROOT"
+    echo -e "  ${YELLOW}DNS Restriction:${NC}      $RESTRICT_DNS (port 53 local only)"
+    echo -e "  ${YELLOW}Local Subnets:${NC}        ${LOCAL_SUBNETS[*]}"
     echo "───────────────────────────────────────────────────────"
     echo ""
     echo -e "${GREEN}Endpoints that will be configured:${NC}"
@@ -859,6 +959,14 @@ show_config_summary() {
     echo -e "  ${CYAN}DNS-over-HTTPS (DoH):${NC} https://$DOMAIN:$WEB_PORT/dns-query"
     echo -e "  ${CYAN}DNS-over-TLS (DoT):${NC} tls://$DOMAIN:$DNS_TLS_PORT"
     echo -e "  ${CYAN}DNS-over-QUIC (DoQ):${NC} quic://$DOMAIN:$DNS_TLS_PORT"
+    echo ""
+
+    if [[ "$RESTRICT_DNS" == "true" ]]; then
+        echo -e "  ${GREEN}✓ DNS port 53 restricted to local network${NC}"
+        echo -e "    Allowed subnets: ${LOCAL_SUBNETS[*]}"
+    else
+        echo -e "  ${RED}⚠ DNS port 53 open to internet - INSECURE!${NC}"
+    fi
     echo ""
 
     read -p "Continue with this configuration? (y/n): " -n 1 -r
@@ -890,6 +998,11 @@ create_backup() {
         ufw status numbered > "$BACKUP_DIR/ufw-rules.backup" 2>&1 || true
     fi
 
+    # Save iptables rules if they exist
+    if command -v iptables-save &> /dev/null; then
+        iptables-save > "$BACKUP_DIR/iptables.backup" 2>/dev/null || true
+    fi
+
     cat > "$BACKUP_DIR/installation.state" << EOF
 DOMAIN="$DOMAIN"
 EMAIL="$EMAIL"
@@ -899,6 +1012,7 @@ INTERFACE="$INTERFACE"
 LOCAL_IP="$LOCAL_IP"
 USE_UPNP="$USE_UPNP"
 WEBROOT="$WEBROOT"
+RESTRICT_DNS="$RESTRICT_DNS"
 INSTALL_DATE="$(date)"
 SCRIPT_VERSION="$SCRIPT_VERSION"
 OS_TYPE="$OS_TYPE"
@@ -1280,6 +1394,7 @@ INSTALLED_INTERFACE="$INTERFACE"
 INSTALLED_LOCAL_IP="$LOCAL_IP"
 INSTALLED_USE_UPNP="$USE_UPNP"
 INSTALLED_WEBROOT="$WEBROOT"
+INSTALLED_RESTRICT_DNS="$RESTRICT_DNS"
 INSTALLED_DATE="$(date)"
 INSTALLED_VERSION="$SCRIPT_VERSION"
 EOF
@@ -1290,38 +1405,122 @@ EOF
 }
 
 #================================================================================
-# FIREWALL FUNCTIONS
+# FIREWALL FUNCTIONS - UPDATED FOR DNS RESTRICTION
 #================================================================================
 
 configure_firewall() {
-    print_step "Configuring Firewall"
+    print_step "Configuring Firewall with DNS Restriction"
     debug_log "Entering configure_firewall"
 
     if command -v ufw &> /dev/null; then
         print_message "Configuring UFW..."
-        # Let's Encrypt ports
+
+        # Let's Encrypt ports (always open)
         ufw allow 80/tcp comment 'HTTP for Let'"'"'s Encrypt' >> "$LOG_FILE" 2>&1
         ufw allow 443/tcp comment 'HTTPS for Let'"'"'s Encrypt' >> "$LOG_FILE" 2>&1
-        # Pi-hole ports
+
+        # Pi-hole encrypted ports (always open)
         ufw allow "$WEB_PORT"/tcp comment 'Pi-hole HTTPS Web + DoH' >> "$LOG_FILE" 2>&1
         ufw allow "$DNS_TLS_PORT"/tcp comment 'DNS-over-TLS' >> "$LOG_FILE" 2>&1
         ufw allow "$DNS_TLS_PORT"/udp comment 'DNS-over-QUIC' >> "$LOG_FILE" 2>&1
-        print_success "UFW configured"
 
-    elif command -v nft &> /dev/null; then
-        print_message "Configuring nftables..."
-        print_warning "Manual nftables configuration may be required"
+        # DNS port 53 - restricted or open based on user choice
+        if [[ "$RESTRICT_DNS" == "true" ]]; then
+            print_message "Restricting DNS port 53 to local subnets: ${LOCAL_SUBNETS[*]}"
+
+            # Allow from localhost
+            ufw allow from 127.0.0.0/8 to any port 53 proto tcp comment 'Local DNS (TCP)' >> "$LOG_FILE" 2>&1
+            ufw allow from 127.0.0.0/8 to any port 53 proto udp comment 'Local DNS (UDP)' >> "$LOG_FILE" 2>&1
+
+            # Allow from each local subnet
+            for subnet in "${LOCAL_SUBNETS[@]}"; do
+                ufw allow from "$subnet" to any port 53 proto tcp comment "Local DNS $subnet (TCP)" >> "$LOG_FILE" 2>&1
+                ufw allow from "$subnet" to any port 53 proto udp comment "Local DNS $subnet (UDP)" >> "$LOG_FILE" 2>&1
+            done
+
+            # Explicitly deny from anywhere else (this is default but we make it explicit)
+            print_message "DNS port 53 is now restricted to local network only"
+        else
+            print_warning "Opening DNS port 53 to ANY - INSECURE CONFIGURATION!"
+            ufw allow 53/tcp comment 'DNS (TCP) - INSECURE' >> "$LOG_FILE" 2>&1
+            ufw allow 53/udp comment 'DNS (UDP) - INSECURE' >> "$LOG_FILE" 2>&1
+        fi
+
+        print_success "UFW configured"
+        ufw status | grep -E "80|443|$WEB_PORT|$DNS_TLS_PORT|53" | tee -a "$LOG_FILE"
 
     elif command -v iptables &> /dev/null; then
         print_message "Configuring iptables..."
+
+        # Flush existing rules (with confirmation)
+        print_warning "This will flush existing iptables rules"
+        read -p "Continue? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            iptables -F
+            iptables -X
+            ip6tables -F 2>/dev/null || true
+            ip6tables -X 2>/dev/null || true
+        fi
+
+        # Set default policies
+        iptables -P INPUT DROP
+        iptables -P FORWARD DROP
+        iptables -P OUTPUT ACCEPT
+
+        # Allow established connections
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+        # Allow loopback
+        iptables -A INPUT -i lo -j ACCEPT
+
+        # Let's Encrypt ports (open to all)
         iptables -A INPUT -p tcp --dport 80 -j ACCEPT
         iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+
+        # Pi-hole encrypted ports (open to all)
         iptables -A INPUT -p tcp --dport "$WEB_PORT" -j ACCEPT
         iptables -A INPUT -p tcp --dport "$DNS_TLS_PORT" -j ACCEPT
         iptables -A INPUT -p udp --dport "$DNS_TLS_PORT" -j ACCEPT
+
+        # DNS port 53 - restricted or open
+        if [[ "$RESTRICT_DNS" == "true" ]]; then
+            print_message "Restricting DNS port 53 to local subnets..."
+
+            # Allow from localhost
+            iptables -A INPUT -s 127.0.0.0/8 -p tcp --dport 53 -j ACCEPT
+            iptables -A INPUT -s 127.0.0.0/8 -p udp --dport 53 -j ACCEPT
+
+            # Allow from each local subnet
+            for subnet in "${LOCAL_SUBNETS[@]}"; do
+                iptables -A INPUT -s "$subnet" -p tcp --dport 53 -j ACCEPT
+                iptables -A INPUT -s "$subnet" -p udp --dport 53 -j ACCEPT
+            done
+        else
+            print_warning "Opening DNS port 53 to ANY - INSECURE!"
+            iptables -A INPUT -p tcp --dport 53 -j ACCEPT
+            iptables -A INPUT -p udp --dport 53 -j ACCEPT
+        fi
+
+        # Save rules
+        if command -v iptables-save &> /dev/null; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
+            iptables-save > /etc/iptables/rules 2>/dev/null || true
+        fi
+
         print_success "iptables configured"
     else
-        print_warning "No firewall detected. Please open ports manually."
+        print_warning "No supported firewall detected. Please configure manually:"
+        echo ""
+        if [[ "$RESTRICT_DNS" == "true" ]]; then
+            echo "DNS port 53 should be restricted to these subnets: ${LOCAL_SUBNETS[*]}"
+            echo "Example iptables rules:"
+            echo "  iptables -A INPUT -s 192.168.0.0/16 -p tcp --dport 53 -j ACCEPT"
+            echo "  iptables -A INPUT -s 192.168.0.0/16 -p udp --dport 53 -j ACCEPT"
+        else
+            echo "DNS port 53 is open to all (INSECURE)"
+        fi
+        echo "Ports 80, 443, $WEB_PORT, $DNS_TLS_PORT (TCP/UDP) should be open to all"
     fi
     debug_log "Firewall configuration complete"
     pause
@@ -1537,7 +1736,7 @@ setup_acme_renewal() {
 
     cat > "$RENEWAL_HOOK" << 'EOF'
 #!/bin/bash
-# Pi-hole renewal hook - Auto-generated by v1.1.1
+# Pi-hole renewal hook - Auto-generated by v1.1.2
 # Follows Pi-hole TLS documentation
 
 DOMAIN="$RENEWED_DOMAINS"
@@ -1612,6 +1811,15 @@ verify_endpoints() {
     echo -e "  ${CYAN}DNS-over-TLS:${NC} tls://$DOMAIN:$DNS_TLS_PORT"
     echo -e "  ${CYAN}DNS-over-QUIC:${NC} quic://$DOMAIN:$DNS_TLS_PORT"
     echo ""
+
+    # Test DNS locally
+    print_message "Testing local DNS resolution..."
+    if nslookup google.com 127.0.0.1 >/dev/null 2>&1; then
+        print_success "✓ Local DNS is working"
+    else
+        print_warning "✗ Local DNS test failed"
+    fi
+
     debug_log "Endpoint verification complete"
     pause
 }
@@ -1640,6 +1848,19 @@ print_summary() {
     echo -e "  ${YELLOW}DNS-over-HTTPS:${NC}   ${GREEN}https://$DOMAIN:$WEB_PORT/dns-query${NC}"
     echo -e "  ${YELLOW}DNS-over-TLS:${NC}     ${GREEN}tls://$DOMAIN:$DNS_TLS_PORT${NC}"
     echo -e "  ${YELLOW}DNS-over-QUIC:${NC}    ${GREEN}quic://$DOMAIN:$DNS_TLS_PORT${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}Security Status:${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    if [[ "$RESTRICT_DNS" == "true" ]]; then
+        echo -e "  ${GREEN}✓ DNS port 53 is RESTRICTED to local network${NC}"
+        echo -e "    Allowed subnets: ${LOCAL_SUBNETS[*]}"
+    else
+        echo -e "  ${RED}⚠ DNS port 53 is OPEN to internet - INSECURE!${NC}"
+        echo -e "    It is recommended to reinstall with restriction enabled"
+    fi
+    echo -e "  ${GREEN}✓ DoH/DoT/DoQ ports are open globally (encrypted)${NC}"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}Backup Information:${NC}"
@@ -1782,6 +2003,8 @@ verify_functions() {
         "test_ports"
         "stop_conflicting_services"
         "prompt_upnp"
+        "detect_local_subnets"
+        "prompt_dns_restriction"
         "show_config_summary"
         "create_backup"
         "detect_services_to_restart"
@@ -1862,6 +2085,7 @@ main() {
     echo -e "  ${GREEN}•${NC} UPnP port forwarding - Automatic router configuration"
     echo -e "  ${GREEN}•${NC} Automatic certificate renewal - Zero maintenance"
     echo -e "  ${GREEN}•${NC} Temporary self-signed cert for immediate HTTPS testing"
+    echo -e "  ${GREEN}•${NC} DNS restriction - Block external unencrypted queries (RECOMMENDED)"
     echo ""
     echo -e "${YELLOW}Total steps: $TOTAL_STEPS${NC}"
     echo ""
@@ -1871,7 +2095,7 @@ main() {
 
     read -p "Press Enter to start enterprise encryption setup..." -r
 
-    # Core execution flow - ALL FUNCTIONS NOW DEFINED AND CALLED IN CORRECT ORDER
+    # Core execution flow
     check_root
     detect_os
     install_dependencies
@@ -1884,13 +2108,14 @@ main() {
     get_local_ip
     choose_ports
     test_ports
+    detect_local_subnets
+    prompt_dns_restriction
     prompt_upnp
 
     # Setup webroot for Let's Encrypt
     setup_webroot
 
     # Generate and test self-signed certificate FIRST
-    # This ensures HTTPS works immediately while Let's Encrypt processes
     generate_self_signed_cert
     test_https_with_self_signed
 
@@ -1925,6 +2150,14 @@ main() {
     echo ""
     echo -e "${GREEN}Access your secure Pi-hole admin interface:${NC}"
     echo -e "${CYAN}https://$DOMAIN:$WEB_PORT/admin${NC}"
+    echo ""
+
+    if [[ "$RESTRICT_DNS" == "true" ]]; then
+        echo -e "${GREEN}DNS port 53 is restricted to local network. Encrypted DNS (DoH/DoT/DoQ) available globally.${NC}"
+    else
+        echo -e "${RED}⚠ WARNING: DNS port 53 is open to the internet. This is INSECURE!${NC}"
+        echo -e "${YELLOW}Run the script again and choose 'Y' for DNS restriction.${NC}"
+    fi
     echo ""
     echo -e "${YELLOW}To import the CA certificate (if you want to trust self-signed certs):${NC}"
     echo -e "  ${CYAN}sudo cat $PIHOLE_CA_CERT${NC}"

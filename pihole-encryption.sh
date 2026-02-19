@@ -4,7 +4,7 @@
 #
 # Wael Isa
 # Build Date: 02/19/2026
-# Version: 1.0.6
+# Version: 1.0.8
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
@@ -13,38 +13,19 @@
 #
 # COMPLETE FIX HISTORY - ALL ISSUES RESOLVED:
 # ==============================================================================
-# v1.0.6 - COMPLETE REWRITE - ALL FUNCTIONS DEFINED AND WORKING
-#        ✅ Added ALL missing functions (39 total functions)
-#        ✅ Fixed check_root command not found error
-#        ✅ Added check_pihole_version function
-#        ✅ Added check_installed function with reinstall/uninstall options
-#        ✅ Added prompt_domain with validation
-#        ✅ Added prompt_email with validation
-#        ✅ Added prompt_upnp with user choice
-#        ✅ Added show_config_summary function
-#        ✅ Added obtain_certificate with Let's Encrypt integration
-#        ✅ Added combine_certificates for Pi-hole format
-#        ✅ Added configure_pihole for DoH/DoT/DoQ setup
-#        ✅ Added configure_upnp with port forwarding
-#        ✅ Added setup_upnp_persistence systemd service
-#        ✅ Added verify_endpoints testing
-#        ✅ Added print_summary with all details
-#        ✅ Added get_port_process for port conflict resolution
-#        ✅ Added detect_services_to_restart
-#        ✅ Added restart_services function
-#        ✅ Added detect_acme_client (certbot/acme.sh)
-#        ✅ Added setup_acme_renewal with hooks
-#        ✅ Added verify_certificate with expiry check
-#        ✅ Added configure_firewall (UFW/nftables/iptables)
-#        ✅ Added stop_conflicting_services
-#        ✅ Added complete uninstall function
-#        ==============================================================================
-#        🎯 TOTAL FUNCTIONS: 39 | TOTAL STEPS: 20 | FULLY AUTOMATED
+# v1.0.8 - FIXED: Script exiting after port selection
+#        - Fixed test_ports function to not exit prematurely
+#        - Added recursive testing after stopping services
+#        - Removed premature exit 1 that was killing the script
+#        - Port conflicts now properly handled without exiting
+#        - User can now stop services and continue normally
 # ==============================================================================
+# v1.0.7 - Added all missing functions
+# v1.0.6 - COMPLETE REWRITE - ALL FUNCTIONS DEFINED
 # v1.0.5 - MASTER RELEASE - FULLY AUTOMATED ENCRYPTION SOLUTION
 # v1.0.4 - Fixed port selection hanging issue
 # v1.0.3 - Improved port 443 handling for Pi-hole native HTTPS
-# v1.0.2 - Added complete backup and restore system for uninstallation
+# v1.0.2 - Added complete backup and restore system
 # v1.0.1 - Added comprehensive DNS encryption support (DoH/DoT/DoQ)
 # ==============================================================================
 #
@@ -53,11 +34,6 @@
 # 🔒 DNS-over-HTTPS (DoH) endpoint: https://YOUR-DOMAIN:PORT/dns-query
 # 🔒 DNS-over-TLS (DoT) endpoint: tls://YOUR-DOMAIN:853
 # 🔒 DNS-over-QUIC (DoQ) endpoint: quic://YOUR-DOMAIN:853
-#
-# Port Forwarding via UPnP (automatic router configuration):
-# 📡 TCP WEB_PORT -> WEB_PORT (HTTPS Web + DoH)
-# 📡 TCP 853      -> 853      (DoT)
-# 📡 UDP 853      -> 853      (DoQ)
 #
 #############################################################################################################################
 
@@ -98,7 +74,7 @@ PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 PIHOLE_OLD_CONFIG="/etc/pihole/pihole.toml.bak"
 BACKUP_DIR="/root/pihole-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.8"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 ACME_HOME="/root/.acme.sh"
@@ -452,7 +428,7 @@ get_local_ip() {
 }
 
 #================================================================================
-# PORT FUNCTIONS
+# PORT FUNCTIONS - FIXED VERSION
 #================================================================================
 
 check_port() {
@@ -544,8 +520,11 @@ choose_ports() {
         if [[ $result -eq 0 ]]; then
             print_warning "Port $WEB_PORT is in use by another service"
             get_port_process "$WEB_PORT" "tcp"
+            echo ""
             read -p "Try another port? (y/n): " try_again
-            [[ "$try_again" =~ ^[Yy]$ ]] && continue
+            if [[ "$try_again" =~ ^[Yy]$ ]]; then
+                continue
+            fi
         elif [[ $result -eq 2 ]]; then
             print_message "Port $WEB_PORT is used by Pi-hole - OK"
         fi
@@ -557,11 +536,15 @@ choose_ports() {
     pause
 }
 
+#================================================================================
+# FIXED TEST PORTS FUNCTION - THIS WAS THE ISSUE
+#================================================================================
+
 test_ports() {
     print_step "Testing Required Ports"
 
     local ports_ok=true
-    local web_port_conflict=false
+    local conflict_found=false
     PORTS_TO_CHECK=(
         "80:tcp:Let's Encrypt HTTP challenge"
         "443:tcp:Let's Encrypt HTTPS (optional)"
@@ -583,10 +566,6 @@ test_ports() {
             PROCESS_INFO=$(get_port_process "$port" "$proto" | head -n1)
             echo -e "  ${RED}✗${NC} Port $port/$proto - $description"
             echo -e "    ${YELLOW}→ In use by:${NC} $PROCESS_INFO"
-
-            if [[ "$port" == "$WEB_PORT" ]]; then
-                web_port_conflict=true
-            fi
             ports_ok=false
 
             if [[ "$port" == "80" ]]; then
@@ -601,49 +580,75 @@ test_ports() {
 
     echo "───────────────────────────────────────────────────────"
 
-    if [[ "$ports_ok" == false ]] && [[ "$web_port_conflict" == true ]]; then
-        print_warning "Web port $WEB_PORT is in use by another service"
+    # FIXED: No more premature exit 1 here!
+    if [[ "$ports_ok" == false ]]; then
+        print_warning "Port conflicts detected."
         echo ""
         echo "Options:"
-        echo "  1) Stop conflicting service and use port $WEB_PORT"
-        echo "  2) Choose a different port"
-        read -p "Choose option (1-2): " port_choice
+        echo "  1) Attempt to stop conflicting services automatically"
+        echo "  2) Choose a different web port"
+        echo "  3) Exit and fix manually"
+        read -p "Choose option (1-3): " port_choice
 
         case $port_choice in
             1)
                 stop_conflicting_services
+                # CRITICAL: Re-run the test after stopping services
+                test_ports
                 ;;
             2)
                 choose_ports
+                # CRITICAL: Re-run the test with new port
+                test_ports
+                ;;
+            3)
+                print_error "Installation aborted by user due to port conflicts."
+                exit 1
+                ;;
+            *)
+                print_error "Invalid choice"
                 test_ports
                 ;;
         esac
-    elif [[ "$ports_ok" == false ]]; then
-        print_error "Some required ports are in use"
-        exit 1
     else
-        print_success "All required ports are available"
+        print_success "All required ports are available or properly configured"
+        # Only pause if we're done with port testing
+        pause
     fi
-    pause
 }
 
 stop_conflicting_services() {
     print_step "Stopping Conflicting Services"
 
+    local stopped=false
+
     for service in nginx apache2 lighttpd httpd; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
+            # Check if it's using any of our ports
             if command -v ss &> /dev/null; then
                 if ss -tlnp 2>/dev/null | grep -E ":$WEB_PORT |:80 " | grep -q "$service"; then
                     print_message "Stopping $service..."
                     systemctl stop "$service"
                     systemctl disable "$service" 2>/dev/null || true
+                    stopped=true
+                fi
+            elif command -v netstat &> /dev/null; then
+                if netstat -tlnp 2>/dev/null | grep -E ":$WEB_PORT |:80 " | grep -q "$service"; then
+                    print_message "Stopping $service..."
+                    systemctl stop "$service"
+                    systemctl disable "$service" 2>/dev/null || true
+                    stopped=true
                 fi
             fi
         fi
     done
 
-    print_success "Conflicting services stopped"
-    pause
+    if [[ "$stopped" == true ]]; then
+        print_success "Conflicting services stopped"
+    else
+        print_warning "No conflicting services found to stop"
+    fi
+    # No pause here - we'll return to test_ports
 }
 
 #================================================================================
@@ -1324,7 +1329,7 @@ main() {
     prompt_email
     get_local_ip
     choose_ports
-    test_ports
+    test_ports      # FIXED: This now properly handles conflicts without exiting
     prompt_upnp
 
     # Pre-installation

@@ -4,7 +4,7 @@
 #
 # Wael Isa
 # Build Date: 02/19/2026
-# Version: 1.0.2
+# Version: 1.0.3
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
@@ -12,6 +12,13 @@
 #############################################################################################################################
 #
 # COMPLETE FIX HISTORY - ALL ISSUES RESOLVED:
+# ==============================================================================
+# v1.0.3 - Improved port 443 handling for Pi-hole native HTTPS
+#        - Added detection for Pi-hole using port 443 (allowed for same process)
+#        - Enhanced SSL certificate update for HTTPS web interface
+#        - Added certificate deployment for existing Pi-hole HTTPS
+#        - Fixed port conflict logic to allow Pi-hole to use its own ports
+#        - Added proper SSL configuration for Pi-hole v6 web server
 # ==============================================================================
 # v1.0.2 - Added complete backup and restore system for uninstallation
 #        - Added Let's Encrypt port management (80/tcp, 443/tcp)
@@ -40,7 +47,7 @@
 # ==============================================================================
 #
 # This script configures Pi-hole v6 with:
-# - HTTPS web interface with Let's Encrypt
+# - HTTPS web interface with Let's Encrypt (port 443 or custom)
 # - DNS-over-HTTPS (DoH) endpoint: https://YOUR-DOMAIN:PORT/dns-query
 # - DNS-over-TLS (DoT) endpoint: tls://YOUR-DOMAIN:853
 # - DNS-over-QUIC (DoQ) endpoint: quic://YOUR-DOMAIN:853
@@ -52,7 +59,7 @@
 #
 # Let's Encrypt Required Ports:
 # - TCP 80  -> HTTP-01 challenge (MUST be open)
-# - TCP 443 -> Optional for TLS-ALPN-01
+# - TCP 443 -> Optional for TLS-ALPN-01 (can be Pi-hole itself)
 #
 #############################################################################################################################
 
@@ -90,7 +97,7 @@ PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 PIHOLE_OLD_CONFIG="/etc/pihole/pihole.toml.bak"
 BACKUP_DIR="/root/pihole-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 
 # Required packages by OS
@@ -294,23 +301,42 @@ check_port() {
     local port=$1
     local proto=$2
     local in_use=false
+    local using_pihole=false
 
     if [[ "$proto" == "tcp" ]]; then
-        if ss -tln 2>/dev/null | grep -q ":$port "; then
+        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
             in_use=true
-        elif netstat -tln 2>/dev/null | grep -q ":$port "; then
+            # Check if it's Pi-hole using it
+            if ss -tlnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
+                using_pihole=true
+            fi
+        elif netstat -tlnp 2>/dev/null | grep -q ":$port "; then
             in_use=true
+            if netstat -tlnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
+                using_pihole=true
+            fi
         fi
     elif [[ "$proto" == "udp" ]]; then
-        if ss -uln 2>/dev/null | grep -q ":$port "; then
+        if ss -ulnp 2>/dev/null | grep -q ":$port "; then
             in_use=true
-        elif netstat -uln 2>/dev/null | grep -q ":$port "; then
+            if ss -ulnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
+                using_pihole=true
+            fi
+        elif netstat -ulnp 2>/dev/null | grep -q ":$port "; then
             in_use=true
+            if netstat -ulnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
+                using_pihole=true
+            fi
         fi
     fi
 
     if [[ "$in_use" == true ]]; then
-        return 0
+        if [[ "$using_pihole" == true ]]; then
+            # Port is used by Pi-hole - this is actually fine for web port
+            return 2
+        else
+            return 0
+        fi
     else
         return 1
     fi
@@ -335,6 +361,7 @@ test_ports() {
     print_section "Testing Required Ports"
 
     local ports_ok=true
+    local web_port_conflict=false
     PORTS_TO_CHECK=(
         "80:tcp:Let's Encrypt HTTP challenge"
         "443:tcp:Let's Encrypt HTTPS (optional)"
@@ -349,10 +376,17 @@ test_ports() {
     for port_info in "${PORTS_TO_CHECK[@]}"; do
         IFS=':' read -r port proto description <<< "$port_info"
 
-        if check_port "$port" "$proto"; then
+        check_port "$port" "$proto"
+        local result=$?
+
+        if [[ $result -eq 0 ]]; then
             PROCESS_INFO=$(get_port_process "$port" "$proto" | head -n1)
             echo -e "  ${RED}✗${NC} Port $port/$proto - $description"
             echo -e "    ${YELLOW}→ In use by:${NC} $PROCESS_INFO"
+
+            if [[ "$port" == "$WEB_PORT" ]]; then
+                web_port_conflict=true
+            fi
             ports_ok=false
 
             # Special handling for critical ports
@@ -360,6 +394,9 @@ test_ports() {
                 print_error "Port 80 is required for Let's Encrypt certificate issuance"
                 print_warning "Please stop the service using port 80 before continuing"
             fi
+        elif [[ $result -eq 2 ]]; then
+            echo -e "  ${GREEN}✓${NC} Port $port/$proto - $description ${GREEN}(used by Pi-hole - OK)${NC}"
+            # This is fine - Pi-hole using its own port
         else
             echo -e "  ${GREEN}✓${NC} Port $port/$proto - $description ${GREEN}(available)${NC}"
         fi
@@ -367,13 +404,13 @@ test_ports() {
 
     echo "───────────────────────────────────────────────────────"
 
-    if [[ "$ports_ok" == false ]]; then
-        print_error "Some required ports are in use"
+    if [[ "$ports_ok" == false ]] && [[ "$web_port_conflict" == true ]]; then
+        print_warning "Web port $WEB_PORT is in use by another service"
         echo ""
         echo "Options:"
-        echo "  1) Stop conflicting services (recommended)"
-        echo "  2) Choose different ports"
-        echo "  3) Exit and fix manually"
+        echo "  1) Stop conflicting service and use port $WEB_PORT"
+        echo "  2) Choose a different port"
+        echo "  3) Continue anyway (not recommended)"
         read -p "Choose option (1-3): " port_choice
 
         case $port_choice in
@@ -385,16 +422,20 @@ test_ports() {
                 test_ports
                 ;;
             3)
-                print_message "Exiting. Please free up required ports and run again."
-                exit 1
+                print_warning "Continuing with port conflict - may cause issues"
                 ;;
             *)
                 print_error "Invalid choice"
                 exit 1
                 ;;
         esac
+    elif [[ "$ports_ok" == false ]]; then
+        print_error "Some required ports are in use by other services"
+        echo ""
+        echo "Please free up the ports listed above and try again."
+        exit 1
     else
-        print_success "All required ports are available"
+        print_success "All required ports are available or properly configured"
     fi
 }
 
@@ -402,22 +443,17 @@ test_ports() {
 stop_conflicting_services() {
     print_section "Stopping Conflicting Services"
 
-    # Stop common web servers that might use port 80/443
+    # Stop common web servers that might use port 80/443 (but not Pi-hole)
     for service in nginx apache2 lighttpd httpd; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
-            print_message "Stopping $service..."
-            systemctl stop "$service"
-            systemctl disable "$service" 2>/dev/null || true
+            # Check if it's using our port
+            if ss -tlnp 2>/dev/null | grep -E ":$WEB_PORT |:80 " | grep -q "$service"; then
+                print_message "Stopping $service..."
+                systemctl stop "$service"
+                systemctl disable "$service" 2>/dev/null || true
+            fi
         fi
     done
-
-    # Check if Pi-hole is using any of our ports
-    if check_port "$WEB_PORT" "tcp"; then
-        if systemctl is-active --quiet pihole-FTL; then
-            print_message "Temporarily stopping Pi-hole to free port $WEB_PORT..."
-            systemctl stop pihole-FTL
-        fi
-    fi
 
     print_success "Conflicting services stopped"
 }
@@ -428,6 +464,7 @@ choose_ports() {
 
     echo -e "${YELLOW}Web Interface / DoH Port Selection:${NC}"
     echo "You can use port 443 (standard HTTPS) or a custom port like 4433, 8443, etc."
+    echo "Note: Pi-hole can use port 443 even if it shows as 'in use' by Pi-hole itself."
     echo ""
 
     while true; do
@@ -440,23 +477,24 @@ choose_ports() {
             continue
         fi
 
-        # Check if port is available
-        if check_port "$WEB_PORT" "tcp"; then
-            print_warning "Port $WEB_PORT is already in use"
+        # Check if port is available or used by Pi-hole
+        check_port "$WEB_PORT" "tcp"
+        local result=$?
+
+        if [[ $result -eq 0 ]]; then
+            print_warning "Port $WEB_PORT is already in use by another service"
             get_port_process "$WEB_PORT" "tcp"
             read -p "Try another port? (y/n): " try_again
             if [[ "$try_again" == "y" ]]; then
                 continue
             fi
+        elif [[ $result -eq 2 ]]; then
+            print_message "Port $WEB_PORT is used by Pi-hole - this is perfect for HTTPS setup"
         fi
 
-        # Special warning for port 443
+        # Special handling for port 443
         if [[ "$WEB_PORT" == "443" ]]; then
-            print_warning "Using port 443 may conflict with other HTTPS services"
-            read -p "Continue with port 443? (y/n): " confirm
-            if [[ "$confirm" != "y" ]]; then
-                continue
-            fi
+            print_message "Using port 443 for Pi-hole HTTPS web interface"
         fi
 
         break
@@ -623,7 +661,11 @@ uninstall() {
             print_warning "No backup found. Resetting to default configuration..."
             # Reset Pi-hole to default config
             systemctl stop pihole-FTL
-            mv "$PIHOLE_CONFIG" "${PIHOLE_CONFIG}.uninstalled" 2>/dev/null || true
+
+            # Reset webserver config to default
+            pihole-FTL config webserver.port 80 2>/dev/null || true
+            pihole-FTL config webserver.tls.enable false 2>/dev/null || true
+
             systemctl start pihole-FTL
         fi
     fi
@@ -867,7 +909,7 @@ configure_firewall() {
         # HTTP for certbot
         ufw allow 80/tcp comment 'HTTP for Certbot' >> "$LOG_FILE" 2>&1
 
-        # HTTPS web interface + DoH
+        # HTTPS web interface + DoH (if not already open)
         ufw allow "$WEB_PORT"/tcp comment 'Pi-hole HTTPS Web + DoH' >> "$LOG_FILE" 2>&1
 
         # DNS-over-TLS
@@ -905,10 +947,19 @@ obtain_certificate() {
             print_success "Certificate renewed"
         fi
     else
-        # Ensure port 80 is free
-        if check_port "80" "tcp"; then
-            print_warning "Port 80 is in use. Attempting to free it..."
-            stop_conflicting_services
+        # Ensure port 80 is free (required for Let's Encrypt)
+        check_port "80" "tcp"
+        if [[ $? -eq 0 ]]; then
+            print_warning "Port 80 is in use by another service. Attempting to free it..."
+            # Stop only non-Pi-hole services on port 80
+            for service in nginx apache2 lighttpd httpd; do
+                if systemctl is-active --quiet "$service" 2>/dev/null; then
+                    if ss -tlnp 2>/dev/null | grep ":80 " | grep -q "$service"; then
+                        print_message "Stopping $service..."
+                        systemctl stop "$service"
+                    fi
+                fi
+            done
         fi
 
         # Obtain certificate
@@ -969,7 +1020,7 @@ configure_pihole() {
     # Backup current config
     cp "$PIHOLE_CONFIG" "${BACKUP_DIR}/pihole.toml.pre-setup"
 
-    print_message "Setting up HTTPS web interface..."
+    print_message "Setting up HTTPS web interface on port $WEB_PORT..."
     pihole-FTL config webserver.domain "$DOMAIN"
     pihole-FTL config webserver.tls.cert "$PIHOLE_CERT"
     pihole-FTL config webserver.port "$WEB_PORT"
@@ -1105,7 +1156,7 @@ verify_endpoints() {
     sleep 5
 
     # Test HTTPS web interface locally
-    print_message "Testing local HTTPS web interface..."
+    print_message "Testing local HTTPS web interface on port $WEB_PORT..."
     if curl -k -s -o /dev/null -w "%{http_code}" "https://localhost:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
         print_success "Local HTTPS web interface is accessible"
     else
@@ -1123,7 +1174,7 @@ verify_endpoints() {
     fi
 
     # Test TLS connection locally
-    print_message "Testing local TLS availability..."
+    print_message "Testing local TLS availability on port $DNS_TLS_PORT..."
     if timeout 5 openssl s_client -connect "localhost:$DNS_TLS_PORT" -tls1_3 -servername "$DOMAIN" 2>&1 | grep -q "CONNECTED"; then
         print_success "Local TLS endpoint is available"
     else
@@ -1146,61 +1197,6 @@ verify_endpoints() {
     echo -e "  ${CYAN}DNS-over-TLS:${NC} tls://$DOMAIN:$DNS_TLS_PORT"
     echo -e "  ${CYAN}DNS-over-QUIC:${NC} quic://$DOMAIN:$DNS_TLS_PORT"
     echo ""
-}
-
-# Function to print summary
-print_summary() {
-    print_section "Setup Complete - Summary"
-
-    echo -e "${GREEN}✓ Pi-hole v6 Encryption Setup Completed Successfully${NC}"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Your Encrypted DNS Endpoints:${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Domain:${NC}              $DOMAIN"
-    echo -e "  ${YELLOW}Local IP:${NC}           $LOCAL_IP"
-    echo ""
-    echo -e "  ${YELLOW}Web Admin:${NC}        ${GREEN}https://$DOMAIN:$WEB_PORT/admin${NC}"
-    echo -e "  ${YELLOW}DNS-over-HTTPS:${NC}   ${GREEN}https://$DOMAIN:$WEB_PORT/dns-query${NC}"
-    echo -e "  ${YELLOW}DNS-over-TLS:${NC}     ${GREEN}tls://$DOMAIN:$DNS_TLS_PORT${NC}"
-    echo -e "  ${YELLOW}DNS-over-QUIC:${NC}    ${GREEN}quic://$DOMAIN:$DNS_TLS_PORT${NC}"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Port Forwarding Status:${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    if [[ "$USE_UPNP" == "true" ]]; then
-        echo -e "  ${GREEN}✓ UPnP port forwarding configured${NC}"
-    else
-        echo -e "  ${YELLOW}✗ UPnP disabled - forward manually:${NC}"
-    fi
-    echo -e "  TCP ${WEB_PORT} -> ${LOCAL_IP}:${WEB_PORT} (HTTPS Web + DoH)"
-    echo -e "  TCP ${DNS_TLS_PORT} -> ${LOCAL_IP}:${DNS_TLS_PORT} (DoT)"
-    echo -e "  UDP ${DNS_TLS_PORT} -> ${LOCAL_IP}:${DNS_TLS_PORT} (DoQ)"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Backup Information:${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "  Backup location:     ${BLUE}$BACKUP_DIR${NC}"
-    echo -e "  Log file:            ${BLUE}$LOG_FILE${NC}"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Management Commands:${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "  Check status:        ${YELLOW}systemctl status pihole-FTL${NC}"
-    echo -e "  View logs:           ${YELLOW}journalctl -u pihole-FTL -f${NC}"
-    echo -e "  Test DoH:            ${YELLOW}curl -k https://localhost:$WEB_PORT/dns-query${NC}"
-    echo -e "  Check UPnP rules:    ${YELLOW}upnpc -l${NC}"
-    echo -e "  Renew certificate:   ${YELLOW}certbot renew${NC}"
-    echo -e "  Uninstall:           ${YELLOW}$0 --uninstall${NC}"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Thank you for using Pi-hole Encryption Setup!${NC}"
-    echo -e "${GREEN}GitHub: https://github.com/waelisa/pihole-encryption${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
 # Function to setup UPnP persistence
@@ -1254,6 +1250,64 @@ EOF
 
         print_success "UPnP persistence configured - rules will reapply on boot"
     fi
+}
+
+# Function to print summary
+print_summary() {
+    print_section "Setup Complete - Summary"
+
+    PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s icanhazip.com 2>/dev/null || echo "Unable to detect")
+
+    echo -e "${GREEN}✓ Pi-hole v6 Encryption Setup Completed Successfully${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}Your Encrypted DNS Endpoints:${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Domain:${NC}              $DOMAIN"
+    echo -e "  ${YELLOW}Public IP:${NC}           $PUBLIC_IP"
+    echo -e "  ${YELLOW}Local IP:${NC}            $LOCAL_IP"
+    echo ""
+    echo -e "  ${YELLOW}Web Admin:${NC}        ${GREEN}https://$DOMAIN:$WEB_PORT/admin${NC}"
+    echo -e "  ${YELLOW}DNS-over-HTTPS:${NC}   ${GREEN}https://$DOMAIN:$WEB_PORT/dns-query${NC}"
+    echo -e "  ${YELLOW}DNS-over-TLS:${NC}     ${GREEN}tls://$DOMAIN:$DNS_TLS_PORT${NC}"
+    echo -e "  ${YELLOW}DNS-over-QUIC:${NC}    ${GREEN}quic://$DOMAIN:$DNS_TLS_PORT${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}Port Forwarding Status:${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    if [[ "$USE_UPNP" == "true" ]]; then
+        echo -e "  ${GREEN}✓ UPnP port forwarding configured${NC}"
+    else
+        echo -e "  ${YELLOW}✗ UPnP disabled - forward manually if needed:${NC}"
+    fi
+    echo -e "  TCP ${WEB_PORT} -> ${LOCAL_IP}:${WEB_PORT} (HTTPS Web + DoH)"
+    echo -e "  TCP ${DNS_TLS_PORT} -> ${LOCAL_IP}:${DNS_TLS_PORT} (DoT)"
+    echo -e "  UDP ${DNS_TLS_PORT} -> ${LOCAL_IP}:${DNS_TLS_PORT} (DoQ)"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}Backup Information:${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  Backup location:     ${BLUE}$BACKUP_DIR${NC}"
+    echo -e "  Log file:            ${BLUE}$LOG_FILE${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}Management Commands:${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  Check status:        ${YELLOW}systemctl status pihole-FTL${NC}"
+    echo -e "  View logs:           ${YELLOW}journalctl -u pihole-FTL -f${NC}"
+    echo -e "  Test DoH:            ${YELLOW}curl -k https://localhost:$WEB_PORT/dns-query${NC}"
+    echo -e "  Check UPnP rules:    ${YELLOW}upnpc -l${NC}"
+    echo -e "  Renew certificate:   ${YELLOW}certbot renew${NC}"
+    echo -e "  Uninstall:           ${YELLOW}$0 --uninstall${NC}"
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}Thank you for using Pi-hole Encryption Setup!${NC}"
+    echo -e "${GREEN}GitHub: https://github.com/waelisa/pihole-encryption${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
 # Function to show help

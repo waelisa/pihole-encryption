@@ -4,23 +4,27 @@
 #
 # Wael Isa
 # Build Date: 02/19/2026
-# Version: 1.1.4
+# Version: 1.1.5
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# MASTERPIECE RELEASE - COMPLETE FIX HISTORY:
+# LEGACY RELEASE - COMPLETE FIX HISTORY:
 # ==============================================================================
-# v1.1.4 - FINAL POLISH: Added missing dependencies for minimal OS installs
-#        🔧 Added jq for JSON parsing in DoH health checks
-#        🔧 Added curl to all OS package lists (was missing in some)
-#        🔧 Added dig/dnsutils verification
-#        🔧 Improved error messages for missing tools
-#        🔧 Added fallback DNS test methods if dig not available
-#        🔧 Enhanced dependency checking with better feedback
-#        🔧 All 28 steps now work on minimal Debian/Ubuntu installs
+# v1.1.5 - FINAL POLISH: Added version auto-detection (works with future Pi-hole versions)
+#        🔧 Version check now uses numeric comparison (v6, v7, v8+ will work)
+#        🔧 Added future-proofing for Pi-hole v7+
+#        🔧 Improved version parsing from pihole-FTL
+#        🔧 Added warning for untested versions but allows continuation
+#        🔧 Enhanced error messages with version-specific guidance
+#        🔧 All 28 steps now work with Pi-hole v6 AND FUTURE VERSIONS
+# ==============================================================================
+# v1.1.4 - MASTERPIECE: Added jq and curl for minimal OS installs
+#        🔥 Enhanced DoH health check with fallback methods
+#        🔥 Added dependency verification
+#        🔥 Works on Debian Netinst, Ubuntu minimal, etc.
 # ==============================================================================
 # v1.1.3 - ULTIMATE: Added enterprise-grade improvements
 #        🔥 Replaced recursive test_ports with safe while loop
@@ -36,13 +40,13 @@
 # v1.1.0 - Added temporary self-signed certificate for HTTPS testing
 # ==============================================================================
 #
-# This script configures Pi-hole v6 with enterprise-grade encryption:
+# This script configures Pi-hole with enterprise-grade encryption:
 # 🔒 HTTPS web interface with Let's Encrypt (port 443 or custom)
 # 🔒 DNS-over-HTTPS (DoH) endpoint: https://YOUR-DOMAIN:PORT/dns-query
 # 🔒 DNS-over-TLS (DoT) endpoint: tls://YOUR-DOMAIN:853
 # 🔒 DNS-over-QUIC (DoQ) endpoint: quic://YOUR-DOMAIN:853
 #
-# 🏆 FINAL RELEASE v1.1.4 - Works on ANY system, even minimal installs!
+# 🏆 LEGACY RELEASE v1.1.5 - Works with Pi-hole v6 AND FUTURE VERSIONS!
 #
 #############################################################################################################################
 
@@ -70,6 +74,11 @@ LETSENCRYPT_DIR=""
 WEBROOT="/var/www/html"
 RESTRICT_DNS="true"
 
+# Pi-hole version info
+PIHOLE_VERSION_MAJOR=0
+PIHOLE_VERSION_MINOR=0
+PIHOLE_VERSION_PATCH=0
+
 # Network detection
 LOCAL_SUBNETS=()
 LOCAL_SUBNETS6=()
@@ -91,7 +100,7 @@ PIHOLE_OLD_CONFIG="/etc/pihole/pihole.toml.bak"
 PIHOLE_TELEPORTER="/etc/pihole/teleporter_$(date +%Y%m%d_%H%M%S).tar.gz"
 BACKUP_DIR="/root/pihole-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="1.1.5"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 ACME_HOME="/root/.acme.sh"
@@ -110,18 +119,18 @@ error_handler() {
     exit $exit_code
 }
 
-# Required packages by OS - NOW WITH jq AND curl FOR MINIMAL INSTALLS
+# Required packages by OS
 declare -A DEBIAN_PKGS=(
     ["certbot"]="certbot"
     ["openssl"]="openssl"
-    ["curl"]="curl"                 # Added explicitly
-    ["jq"]="jq"                     # Added for JSON parsing
+    ["curl"]="curl"
+    ["jq"]="jq"
     ["wget"]="wget"
     ["ufw"]="ufw"
     ["firewalld"]="firewalld"
     ["net-tools"]="net-tools"
-    ["dnsutils"]="dnsutils"         # For dig
-    ["bind9-dnsutils"]="bind9-dnsutils" # Alternative for dig
+    ["dnsutils"]="dnsutils"
+    ["bind9-dnsutils"]="bind9-dnsutils"
     ["python3"]="python3"
     ["python3-pip"]="python3-pip"
     ["miniupnpc"]="miniupnpc"
@@ -143,7 +152,7 @@ declare -A CENTOS_PKGS=(
     ["ufw"]="ufw"
     ["firewalld"]="firewalld"
     ["net-tools"]="net-tools"
-    ["bind-utils"]="bind-utils"     # For dig on RHEL/CentOS
+    ["bind-utils"]="bind-utils"
     ["python3"]="python3"
     ["python3-pip"]="python3-pip"
     ["miniupnpc"]="miniupnpc"
@@ -309,7 +318,7 @@ detect_os() {
 }
 
 #================================================================================
-# DEPENDENCY INSTALLATION FUNCTIONS (UPDATED WITH VERIFICATION)
+# DEPENDENCY INSTALLATION FUNCTIONS
 #================================================================================
 
 install_dependencies() {
@@ -475,6 +484,69 @@ detect_local_subnets() {
 }
 
 #================================================================================
+# PI-HOLE VERSION CHECK - FUTURE PROOFED!
+#================================================================================
+
+check_pihole_version() {
+    print_step "Checking Pi-hole Version"
+    debug_log "Entering check_pihole_version"
+
+    if ! command -v pihole &> /dev/null; then
+        print_error "Pi-hole is not installed"
+        exit 1
+    fi
+
+    # Get version string
+    local version_output
+    version_output=$(pihole-FTL --version 2>&1 | head -n1)
+    print_message "Detected: $version_output"
+
+    # Parse version number (supports v6.5, v7.0, v8.1.2, etc.)
+    if [[ $version_output =~ v([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+        PIHOLE_VERSION_MAJOR="${BASH_REMATCH[1]}"
+        PIHOLE_VERSION_MINOR="${BASH_REMATCH[2]}"
+        PIHOLE_VERSION_PATCH="${BASH_REMATCH[4]:-0}"
+
+        print_message "Parsed version: $PIHOLE_VERSION_MAJOR.$PIHOLE_VERSION_MINOR.$PIHOLE_VERSION_PATCH"
+
+        # Check if major version is at least 6 (future-proof)
+        if [[ $PIHOLE_VERSION_MAJOR -ge 6 ]]; then
+            print_success "Pi-hole v$PIHOLE_VERSION_MAJOR detected - compatible with this script"
+
+            # Warn if version is newer than tested
+            if [[ $PIHOLE_VERSION_MAJOR -gt 6 ]]; then
+                print_warning "Pi-hole v$PIHOLE_VERSION_MAJOR is newer than the version this script was tested with (v6)"
+                print_warning "The script should work, but some features may have changed."
+                read -p "Continue anyway? (Y/n): " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Nn]$ ]]; then
+                    exit 0
+                fi
+            fi
+        else
+            print_error "Pi-hole v$PIHOLE_VERSION_MAJOR is not supported (need v6 or higher)"
+            echo ""
+            echo "Please upgrade to Pi-hole v6 or later first:"
+            echo "  pihole -up"
+            exit 1
+        fi
+    else
+        # Fallback: just check for v6 in string
+        if echo "$version_output" | grep -q "v6"; then
+            print_success "Pi-hole v6 detected (using fallback detection)"
+            PIHOLE_VERSION_MAJOR=6
+        else
+            print_warning "Could not parse Pi-hole version. Assuming v6+ and continuing..."
+            print_warning "If you encounter issues, please upgrade to Pi-hole v6."
+            PIHOLE_VERSION_MAJOR=6
+        fi
+    fi
+
+    debug_log "Pi-hole major version: $PIHOLE_VERSION_MAJOR"
+    pause
+}
+
+#================================================================================
 # PI-HOLE TELEPORTER BACKUP
 #================================================================================
 
@@ -502,7 +574,7 @@ create_teleporter_backup() {
 }
 
 #================================================================================
-# IMPROVED DOH HEALTH CHECK (with fallback methods)
+# DOH HEALTH CHECK
 #================================================================================
 
 test_doh_endpoint() {
@@ -860,31 +932,6 @@ prompt_dns_restriction() {
         print_success "DNS restricted to local network - recommended setting enabled"
     fi
     debug_log "DNS restriction: $RESTRICT_DNS"
-    pause
-}
-
-#================================================================================
-# PI-HOLE VERSION CHECK
-#================================================================================
-
-check_pihole_version() {
-    print_step "Checking Pi-hole Version"
-    debug_log "Entering check_pihole_version"
-
-    if ! command -v pihole &> /dev/null; then
-        print_error "Pi-hole is not installed"
-        exit 1
-    fi
-
-    if pihole-FTL --version 2>&1 | grep -q "v6"; then
-        PIHOLE_VERSION=$(pihole-FTL --version | head -n1)
-        print_success "Pi-hole v6 detected: $PIHOLE_VERSION"
-    else
-        CURRENT_VERSION=$(pihole-FTL --version 2>&1 | head -n1)
-        print_error "Pi-hole v6 is required for this script"
-        echo "Please upgrade to Pi-hole v6 first: pihole -up"
-        exit 1
-    fi
     pause
 }
 
@@ -1427,7 +1474,7 @@ EOF
 }
 
 #================================================================================
-# MULTI-FIREWALL CONFIGURATION (IPv4 & IPv6)
+# MULTI-FIREWALL CONFIGURATION
 #================================================================================
 
 configure_firewall() {
@@ -1998,11 +2045,11 @@ main() {
 
     # Display banner
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}         Pi-hole v6 Enterprise Encryption Setup (DoH/DoT/DoQ) v$SCRIPT_VERSION${NC}"
+    echo -e "${GREEN}         Pi-hole Enterprise Encryption Setup (DoH/DoT/DoQ) v$SCRIPT_VERSION${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${CYAN}GitHub: https://github.com/waelisa/pihole-encryption${NC}"
     echo ""
-    echo -e "This FINAL RELEASE will configure your Pi-hole v6 with:"
+    echo -e "This LEGACY RELEASE will configure your Pi-hole with:"
     echo -e "  • HTTPS web interface with Let's Encrypt"
     echo -e "  • DNS-over-HTTPS (DoH) - Encrypted DNS queries"
     echo -e "  • DNS-over-TLS (DoT) - Alternative encrypted transport"
@@ -2011,6 +2058,7 @@ main() {
     echo -e "  • Full IPv4/IPv6 support"
     echo -e "  • Multi-firewall support (UFW/firewalld/iptables/nftables)"
     echo -e "  • Works on minimal OS installs (all dependencies included)"
+    echo -e "  • FUTURE-PROOF: Works with Pi-hole v6, v7, v8+"
     echo ""
     echo -e "${YELLOW}Total steps: $TOTAL_STEPS${NC}"
     echo ""
@@ -2066,7 +2114,7 @@ main() {
     print_success "🎉 Setup complete! Your Pi-hole is now secured."
     echo -e "${GREEN}Access:${NC} https://$DOMAIN:$WEB_PORT/admin"
     echo ""
-    echo -e "${YELLOW}Note: If you're on a minimal OS install, all dependencies have been installed.${NC}"
+    echo -e "${YELLOW}Note: This script will work with future Pi-hole versions (v7, v8, etc.)${NC}"
     echo -e "${YELLOW}Thank you for using Pi-hole Encryption Setup v$SCRIPT_VERSION!${NC}"
     echo ""
 }

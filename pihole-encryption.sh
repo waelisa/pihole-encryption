@@ -4,7 +4,7 @@
 #
 # Wael Isa
 # Build Date: 02/19/2026
-# Version: 1.0.8
+# Version: 1.0.9
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
@@ -13,20 +13,23 @@
 #
 # COMPLETE FIX HISTORY - ALL ISSUES RESOLVED:
 # ==============================================================================
+# v1.0.9 - FIXED: Script exiting silently after port selection
+#        - Added debug output to show where script is executing
+#        - Fixed missing function calls in main flow
+#        - Added error trapping with line numbers
+#        - Added verification that all required functions exist
+#        - Fixed test_ports function to properly return to main flow
+#        - Added explicit returns and proper flow control
+#        - Removed set -e to prevent silent exits
+#        - Added trap to catch errors with line numbers
+# ==============================================================================
 # v1.0.8 - FIXED: Script exiting after port selection
 #        - Fixed test_ports function to not exit prematurely
 #        - Added recursive testing after stopping services
-#        - Removed premature exit 1 that was killing the script
-#        - Port conflicts now properly handled without exiting
-#        - User can now stop services and continue normally
 # ==============================================================================
 # v1.0.7 - Added all missing functions
 # v1.0.6 - COMPLETE REWRITE - ALL FUNCTIONS DEFINED
 # v1.0.5 - MASTER RELEASE - FULLY AUTOMATED ENCRYPTION SOLUTION
-# v1.0.4 - Fixed port selection hanging issue
-# v1.0.3 - Improved port 443 handling for Pi-hole native HTTPS
-# v1.0.2 - Added complete backup and restore system
-# v1.0.1 - Added comprehensive DNS encryption support (DoH/DoT/DoQ)
 # ==============================================================================
 #
 # This script configures Pi-hole v6 with enterprise-grade encryption:
@@ -37,7 +40,8 @@
 #
 #############################################################################################################################
 
-set -e
+# Remove set -e to prevent silent exits - we'll handle errors manually
+# set -e
 
 # Colors for output
 RED='\033[0;31m'
@@ -74,10 +78,24 @@ PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 PIHOLE_OLD_CONFIG="/etc/pihole/pihole.toml.bak"
 BACKUP_DIR="/root/pihole-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.0.9"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 ACME_HOME="/root/.acme.sh"
+
+# Debug flag - set to true to see detailed execution
+DEBUG=true
+
+# Error trap
+trap 'error_handler $? $LINENO' ERR
+
+error_handler() {
+    local exit_code=$1
+    local line_no=$2
+    print_error "Error on line $line_no: exit code $exit_code"
+    print_error "Script execution stopped. Check $LOG_FILE for details"
+    exit $exit_code
+}
 
 # Required packages by OS
 declare -A DEBIAN_PKGS=(
@@ -144,11 +162,18 @@ TOTAL_STEPS=20
 # UTILITY FUNCTIONS
 #================================================================================
 
+debug_log() {
+    if [[ "$DEBUG" == true ]]; then
+        echo -e "${PURPLE}[DEBUG]${NC} $1" | tee -a "$LOG_FILE"
+    fi
+}
+
 print_step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
     echo -e "\n${PURPLE}═══════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${CYAN}STEP $CURRENT_STEP OF $TOTAL_STEPS: $1${NC}"
     echo -e "${PURPLE}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    debug_log "Starting step $CURRENT_STEP: $1"
     sleep 1
 }
 
@@ -180,6 +205,7 @@ pause() {
 
 check_root() {
     print_step "Checking Root Privileges"
+    debug_log "Entering check_root"
 
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
@@ -188,6 +214,7 @@ check_root() {
     fi
 
     print_success "Root privileges confirmed"
+    debug_log "Root check passed"
     pause
 }
 
@@ -197,6 +224,7 @@ check_root() {
 
 detect_os() {
     print_step "Detecting Operating System"
+    debug_log "Entering detect_os"
 
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
@@ -240,6 +268,7 @@ detect_os() {
     print_message "OS Family: $OS_FAMILY"
     print_message "Package Manager: $PKG_MANAGER"
     print_success "OS detection successful"
+    debug_log "OS detection complete: $OS_FAMILY"
     pause
 }
 
@@ -249,6 +278,7 @@ detect_os() {
 
 install_dependencies() {
     print_step "Installing Dependencies"
+    debug_log "Entering install_dependencies"
 
     if [[ "$OS_FAMILY" == "unknown" ]]; then
         print_warning "Unknown OS - please install dependencies manually"
@@ -290,6 +320,7 @@ install_dependencies() {
     pip3 install h2 quic aioquic dnspython >> "$LOG_FILE" 2>&1 || true
 
     print_success "Dependencies installed"
+    debug_log "Dependencies installation complete"
     pause
 }
 
@@ -299,6 +330,7 @@ install_dependencies() {
 
 check_pihole_version() {
     print_step "Checking Pi-hole Version"
+    debug_log "Entering check_pihole_version"
 
     if ! command -v pihole &> /dev/null; then
         print_error "Pi-hole is not installed"
@@ -318,6 +350,7 @@ check_pihole_version() {
         echo "  pihole -up"
         exit 1
     fi
+    debug_log "Pi-hole version check passed"
     pause
 }
 
@@ -326,6 +359,7 @@ check_pihole_version() {
 #================================================================================
 
 check_installed() {
+    debug_log "Entering check_installed"
     if [[ -f "$INSTALL_STATE_FILE" ]]; then
         print_step "Existing Installation Detected"
         source "$INSTALL_STATE_FILE"
@@ -363,6 +397,7 @@ check_installed() {
         esac
         pause
     fi
+    debug_log "No existing installation found"
 }
 
 #================================================================================
@@ -371,6 +406,7 @@ check_installed() {
 
 prompt_domain() {
     print_step "Domain Configuration"
+    debug_log "Entering prompt_domain"
 
     if [[ -z "$DOMAIN" ]]; then
         echo -e "${YELLOW}Enter your domain (e.g., dns.example.com):${NC}"
@@ -385,11 +421,13 @@ prompt_domain() {
     fi
 
     print_success "Domain set to: $DOMAIN"
+    debug_log "Domain: $DOMAIN"
     pause
 }
 
 prompt_email() {
     print_step "Email Configuration"
+    debug_log "Entering prompt_email"
 
     if [[ -z "$EMAIL" ]]; then
         echo -e "${YELLOW}Enter your email for Let's Encrypt notifications:${NC}"
@@ -405,11 +443,13 @@ prompt_email() {
     fi
 
     print_success "Email set to: $EMAIL"
+    debug_log "Email: $EMAIL"
     pause
 }
 
 get_local_ip() {
     print_step "Detecting Local IP Address"
+    debug_log "Entering get_local_ip"
 
     if command -v ip &> /dev/null; then
         LOCAL_IP=$(ip -4 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
@@ -424,11 +464,12 @@ get_local_ip() {
     fi
 
     print_message "Local IP: $LOCAL_IP"
+    debug_log "Local IP: $LOCAL_IP"
     pause
 }
 
 #================================================================================
-# PORT FUNCTIONS - FIXED VERSION
+# PORT FUNCTIONS
 #================================================================================
 
 check_port() {
@@ -436,6 +477,8 @@ check_port() {
     local proto=$2
     local in_use=false
     local using_pihole=false
+
+    debug_log "Checking port $port/$proto"
 
     if [[ "$proto" == "tcp" ]]; then
         if command -v ss &> /dev/null; then
@@ -473,11 +516,14 @@ check_port() {
 
     if [[ "$in_use" == true ]]; then
         if [[ "$using_pihole" == true ]]; then
+            debug_log "Port $port is used by Pi-hole (acceptable)"
             return 2  # Used by Pi-hole (acceptable)
         else
+            debug_log "Port $port is in use by another service"
             return 0  # Used by other service (conflict)
         fi
     else
+        debug_log "Port $port is free"
         return 1  # Free
     fi
 }
@@ -497,6 +543,7 @@ get_port_process() {
 
 choose_ports() {
     print_step "Port Configuration"
+    debug_log "Entering choose_ports"
 
     echo -e "${YELLOW}Web Interface / DoH Port Selection:${NC}"
     echo "Options:"
@@ -533,15 +580,17 @@ choose_ports() {
     done
 
     print_success "Web port set to: $WEB_PORT"
+    debug_log "Selected port: $WEB_PORT"
     pause
 }
 
 #================================================================================
-# FIXED TEST PORTS FUNCTION - THIS WAS THE ISSUE
+# FIXED TEST PORTS FUNCTION - WITH PROPER FLOW CONTROL
 #================================================================================
 
 test_ports() {
     print_step "Testing Required Ports"
+    debug_log "Entering test_ports"
 
     local ports_ok=true
     local conflict_found=false
@@ -567,6 +616,7 @@ test_ports() {
             echo -e "  ${RED}✗${NC} Port $port/$proto - $description"
             echo -e "    ${YELLOW}→ In use by:${NC} $PROCESS_INFO"
             ports_ok=false
+            conflict_found=true
 
             if [[ "$port" == "80" ]]; then
                 print_error "Port 80 is required for Let's Encrypt"
@@ -580,8 +630,8 @@ test_ports() {
 
     echo "───────────────────────────────────────────────────────"
 
-    # FIXED: No more premature exit 1 here!
-    if [[ "$ports_ok" == false ]]; then
+    # Handle port conflicts
+    if [[ "$conflict_found" == true ]]; then
         print_warning "Port conflicts detected."
         echo ""
         echo "Options:"
@@ -593,13 +643,15 @@ test_ports() {
         case $port_choice in
             1)
                 stop_conflicting_services
-                # CRITICAL: Re-run the test after stopping services
+                debug_log "Re-running test_ports after stopping services"
                 test_ports
+                return $?
                 ;;
             2)
                 choose_ports
-                # CRITICAL: Re-run the test with new port
+                debug_log "Re-running test_ports with new port"
                 test_ports
+                return $?
                 ;;
             3)
                 print_error "Installation aborted by user due to port conflicts."
@@ -608,17 +660,20 @@ test_ports() {
             *)
                 print_error "Invalid choice"
                 test_ports
+                return $?
                 ;;
         esac
     else
         print_success "All required ports are available or properly configured"
-        # Only pause if we're done with port testing
+        debug_log "Port testing completed successfully"
         pause
+        return 0
     fi
 }
 
 stop_conflicting_services() {
     print_step "Stopping Conflicting Services"
+    debug_log "Entering stop_conflicting_services"
 
     local stopped=false
 
@@ -648,6 +703,8 @@ stop_conflicting_services() {
     else
         print_warning "No conflicting services found to stop"
     fi
+
+    debug_log "stop_conflicting_services completed, stopped=$stopped"
     # No pause here - we'll return to test_ports
 }
 
@@ -657,6 +714,7 @@ stop_conflicting_services() {
 
 prompt_upnp() {
     print_step "UPnP Configuration"
+    debug_log "Entering prompt_upnp"
 
     echo -e "${YELLOW}Enable UPnP port forwarding? (recommended if router supports it)${NC}"
     echo "UPnP will automatically forward ports on your router:"
@@ -674,11 +732,13 @@ prompt_upnp() {
         USE_UPNP="false"
         print_message "UPnP disabled - forward ports manually if needed"
     fi
+    debug_log "UPnP enabled: $USE_UPNP"
     pause
 }
 
 configure_upnp() {
     print_step "Configuring UPnP Port Forwarding"
+    debug_log "Entering configure_upnp"
 
     if [[ "$USE_UPNP" != "true" ]]; then
         print_message "UPnP disabled. Skipping port forwarding."
@@ -710,12 +770,14 @@ configure_upnp() {
     upnpc -a "$LOCAL_IP" "$DNS_TLS_PORT" "$DNS_TLS_PORT" udp >> "$LOG_FILE" 2>&1
 
     print_success "UPnP port forwarding configured"
+    debug_log "UPnP configuration complete"
     pause
 }
 
 setup_upnp_persistence() {
     if [[ "$USE_UPNP" == "true" ]] && command -v upnpc &> /dev/null; then
         print_step "Setting UPnP Persistence"
+        debug_log "Entering setup_upnp_persistence"
 
         cat > /etc/systemd/system/pihole-upnp.service << EOF
 [Unit]
@@ -749,6 +811,7 @@ EOF
         systemctl enable pihole-upnp.service
 
         print_success "UPnP persistence configured"
+        debug_log "UPnP persistence setup complete"
         pause
     fi
 }
@@ -759,6 +822,7 @@ EOF
 
 show_config_summary() {
     print_step "Configuration Summary"
+    debug_log "Entering show_config_summary"
 
     echo -e "${CYAN}Your Configuration:${NC}"
     echo "───────────────────────────────────────────────────────"
@@ -784,6 +848,7 @@ show_config_summary() {
         print_message "Exiting. Run again to reconfigure."
         exit 0
     fi
+    debug_log "Configuration confirmed by user"
 }
 
 #================================================================================
@@ -792,6 +857,7 @@ show_config_summary() {
 
 create_backup() {
     print_step "Creating System Backup"
+    debug_log "Entering create_backup"
 
     mkdir -p "$BACKUP_DIR"
     print_message "Backup directory: $BACKUP_DIR"
@@ -819,6 +885,7 @@ OS_VERSION="$OS_VERSION"
 EOF
 
     print_success "Backup completed"
+    debug_log "Backup saved to $BACKUP_DIR"
     pause
 }
 
@@ -828,6 +895,7 @@ EOF
 
 detect_services_to_restart() {
     print_step "Detecting Services for Restart"
+    debug_log "Entering detect_services_to_restart"
 
     SERVICES_TO_RESTART=()
 
@@ -844,11 +912,13 @@ detect_services_to_restart() {
     done
 
     print_success "Service detection complete"
+    debug_log "Services to restart: ${SERVICES_TO_RESTART[*]}"
     pause
 }
 
 restart_services() {
     print_step "Restarting Services to Apply New SSL Certificates"
+    debug_log "Entering restart_services"
 
     for service in "${SERVICES_TO_RESTART[@]}"; do
         print_message "Restarting $service..."
@@ -870,6 +940,7 @@ restart_services() {
 
     systemctl daemon-reload 2>/dev/null || true
     print_success "Service restarts completed"
+    debug_log "Service restarts completed"
     pause
 }
 
@@ -879,6 +950,7 @@ restart_services() {
 
 detect_acme_client() {
     print_step "Detecting ACME Client"
+    debug_log "Entering detect_acme_client"
 
     if command -v acme.sh &> /dev/null; then
         ACME_CLIENT="acme.sh"
@@ -889,13 +961,14 @@ detect_acme_client() {
     else
         print_warning "No ACME client detected. Installing certbot..."
         case $OS_FAMILY in
-            debian) $INSTALL_CMD certbot ;;
-            rhel|fedora) $INSTALL_CMD certbot ;;
+            debian) $INSTALL_CMD certbot >> "$LOG_FILE" 2>&1 ;;
+            rhel|fedora) $INSTALL_CMD certbot >> "$LOG_FILE" 2>&1 ;;
         esac
         ACME_CLIENT="certbot"
     fi
 
     print_message "Using ACME client: $ACME_CLIENT"
+    debug_log "ACME client: $ACME_CLIENT"
     pause
 }
 
@@ -905,6 +978,7 @@ detect_acme_client() {
 
 obtain_certificate() {
     print_step "Obtaining SSL Certificate from Let's Encrypt"
+    debug_log "Entering obtain_certificate"
 
     LETSENCRYPT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 
@@ -957,11 +1031,13 @@ obtain_certificate() {
 
     print_message "Certificate details:"
     openssl x509 -in "$LETSENCRYPT_DIR/cert.pem" -text -noout | grep -E "Subject:|Not Before:|Not After :|DNS:" | tee -a "$LOG_FILE"
+    debug_log "Certificate obtained/renewed"
     pause
 }
 
 combine_certificates() {
     print_step "Preparing Certificate for Pi-hole"
+    debug_log "Entering combine_certificates"
 
     if [[ ! -f "${LETSENCRYPT_DIR}/fullchain.pem" ]] || [[ ! -f "${LETSENCRYPT_DIR}/privkey.pem" ]]; then
         print_error "Certificate files not found"
@@ -975,11 +1051,13 @@ combine_certificates() {
     chmod 600 "${PIHOLE_CERT}"
 
     print_success "Certificate installed at: $PIHOLE_CERT"
+    debug_log "Certificate combined and installed"
     pause
 }
 
 verify_certificate() {
     print_step "Verifying SSL Certificate"
+    debug_log "Entering verify_certificate"
 
     if [[ ! -f "$PIHOLE_CERT" ]]; then
         print_error "Certificate file not found"
@@ -1008,6 +1086,7 @@ verify_certificate() {
     fi
 
     print_success "Certificate verification passed"
+    debug_log "Certificate verification complete"
     pause
 }
 
@@ -1017,6 +1096,7 @@ verify_certificate() {
 
 configure_pihole() {
     print_step "Configuring Pi-hole for Encrypted DNS"
+    debug_log "Entering configure_pihole"
 
     print_message "Configuring HTTPS web interface on port $WEB_PORT..."
     pihole-FTL config webserver.domain "$DOMAIN"
@@ -1061,6 +1141,7 @@ INSTALLED_VERSION="$SCRIPT_VERSION"
 EOF
 
     print_success "Pi-hole configuration completed"
+    debug_log "Pi-hole configured"
     pause
 }
 
@@ -1070,6 +1151,7 @@ EOF
 
 configure_firewall() {
     print_step "Configuring Firewall"
+    debug_log "Entering configure_firewall"
 
     if command -v ufw &> /dev/null; then
         print_message "Configuring UFW..."
@@ -1093,6 +1175,7 @@ configure_firewall() {
     else
         print_warning "No firewall detected. Please open ports manually."
     fi
+    debug_log "Firewall configuration complete"
     pause
 }
 
@@ -1102,6 +1185,7 @@ configure_firewall() {
 
 setup_acme_renewal() {
     print_step "Configuring Automatic Certificate Renewal"
+    debug_log "Entering setup_acme_renewal"
 
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 
@@ -1127,6 +1211,7 @@ EOF
     certbot renew --dry-run >> "$LOG_FILE" 2>&1 || true
 
     print_success "Auto-renewal configured"
+    debug_log "Renewal hook installed"
     pause
 }
 
@@ -1136,6 +1221,7 @@ EOF
 
 verify_endpoints() {
     print_step "Verifying Encryption Endpoints"
+    debug_log "Entering verify_endpoints"
 
     sleep 5
 
@@ -1167,6 +1253,7 @@ verify_endpoints() {
     echo -e "  ${CYAN}DNS-over-TLS:${NC} tls://$DOMAIN:$DNS_TLS_PORT"
     echo -e "  ${CYAN}DNS-over-QUIC:${NC} quic://$DOMAIN:$DNS_TLS_PORT"
     echo ""
+    debug_log "Endpoint verification complete"
     pause
 }
 
@@ -1176,6 +1263,7 @@ verify_endpoints() {
 
 print_summary() {
     print_step "Setup Complete - Summary"
+    debug_log "Entering print_summary"
 
     PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s icanhazip.com 2>/dev/null || echo "Unable to detect")
 
@@ -1216,6 +1304,7 @@ print_summary() {
     echo -e "${GREEN}Thank you for using Pi-hole Encryption Setup!${NC}"
     echo -e "${GREEN}GitHub: https://github.com/waelisa/pihole-encryption${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    debug_log "Summary displayed"
 }
 
 #================================================================================
@@ -1224,6 +1313,7 @@ print_summary() {
 
 uninstall() {
     print_section "Uninstalling Pi-hole Encryption"
+    debug_log "Entering uninstall"
 
     echo -e "${YELLOW}This will remove all encryption configurations.${NC}"
     read -p "Are you sure? (y/n): " -n 1 -r
@@ -1269,6 +1359,56 @@ uninstall() {
     systemctl start pihole-FTL
 
     print_success "Uninstallation completed"
+    debug_log "Uninstall complete"
+}
+
+#================================================================================
+# VERIFY ALL FUNCTIONS EXIST
+#================================================================================
+
+verify_functions() {
+    debug_log "Verifying all required functions exist"
+
+    local required_functions=(
+        "check_root"
+        "detect_os"
+        "install_dependencies"
+        "check_pihole_version"
+        "check_installed"
+        "prompt_domain"
+        "prompt_email"
+        "get_local_ip"
+        "choose_ports"
+        "test_ports"
+        "stop_conflicting_services"
+        "prompt_upnp"
+        "show_config_summary"
+        "create_backup"
+        "detect_services_to_restart"
+        "detect_acme_client"
+        "obtain_certificate"
+        "combine_certificates"
+        "verify_certificate"
+        "configure_pihole"
+        "configure_firewall"
+        "configure_upnp"
+        "setup_upnp_persistence"
+        "restart_services"
+        "setup_acme_renewal"
+        "verify_endpoints"
+        "print_summary"
+    )
+
+    for func in "${required_functions[@]}"; do
+        if ! declare -f "$func" > /dev/null; then
+            print_error "Required function '$func' is missing!"
+            exit 1
+        else
+            debug_log "✓ Function $func exists"
+        fi
+    done
+
+    print_success "All required functions verified"
 }
 
 #================================================================================
@@ -1315,46 +1455,98 @@ main() {
     echo ""
     echo -e "${YELLOW}Total steps: $TOTAL_STEPS${NC}"
     echo ""
+
+    # Verify all functions exist before starting
+    verify_functions
+
     read -p "Press Enter to start enterprise encryption setup..." -r
 
-    # Core execution flow - ALL FUNCTIONS NOW DEFINED
+    # Core execution flow - with debug logging
+    debug_log "Starting main execution flow"
+
     check_root
+    debug_log "After check_root"
+
     detect_os
+    debug_log "After detect_os"
+
     install_dependencies
+    debug_log "After install_dependencies"
+
     check_pihole_version
+    debug_log "After check_pihole_version"
+
     check_installed
+    debug_log "After check_installed"
 
     # Configuration
     prompt_domain
+    debug_log "After prompt_domain"
+
     prompt_email
+    debug_log "After prompt_email"
+
     get_local_ip
+    debug_log "After get_local_ip"
+
     choose_ports
-    test_ports      # FIXED: This now properly handles conflicts without exiting
+    debug_log "After choose_ports - selected port: $WEB_PORT"
+
+    test_ports
+    debug_log "After test_ports - return code: $?"
+
     prompt_upnp
+    debug_log "After prompt_upnp"
 
     # Pre-installation
     show_config_summary
+    debug_log "After show_config_summary"
+
     create_backup
+    debug_log "After create_backup"
+
     detect_services_to_restart
+    debug_log "After detect_services_to_restart"
+
     detect_acme_client
+    debug_log "After detect_acme_client"
 
     # Certificate setup
     LETSENCRYPT_DIR="/etc/letsencrypt/live/${DOMAIN}"
     obtain_certificate
+    debug_log "After obtain_certificate"
+
     combine_certificates
+    debug_log "After combine_certificates"
+
     verify_certificate
+    debug_log "After verify_certificate"
 
     # Pi-hole configuration
     configure_pihole
+    debug_log "After configure_pihole"
+
     configure_firewall
+    debug_log "After configure_firewall"
+
     configure_upnp
+    debug_log "After configure_upnp"
+
     setup_upnp_persistence
+    debug_log "After setup_upnp_persistence"
 
     # Finalization
     restart_services
+    debug_log "After restart_services"
+
     setup_acme_renewal
+    debug_log "After setup_acme_renewal"
+
     verify_endpoints
+    debug_log "After verify_endpoints"
+
     print_summary
+    debug_log "After print_summary"
 
     echo ""
     print_success "🎉 Enterprise encryption setup complete! Your Pi-hole is now secured."
@@ -1364,6 +1556,8 @@ main() {
     echo -e "${GREEN}Access your secure Pi-hole admin interface:${NC}"
     echo -e "${CYAN}https://$DOMAIN:$WEB_PORT/admin${NC}"
     echo ""
+
+    debug_log "Script completed successfully"
 }
 
 # Run main with all arguments

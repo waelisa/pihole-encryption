@@ -4,20 +4,21 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.2.0
+# Version: 1.2.1
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.2.0 - FIXED: HTTPS validation after self-signed cert generation
-#        ✅ Fixed: Proper service restart with verification
-#        ✅ Added: Certificate verification before HTTPS test
-#        ✅ Added: Multiple restart attempts with increasing delays
-#        ✅ Added: Port binding verification
-#        ✅ Added: Process check to ensure FTL is running
-#        ✅ Fixed: Better error messages with specific failure reasons
+# v1.2.1 - FIXED: HTTPS validation logic - NOW ASKS BEFORE RESTORING!
+#        ✅ Fixed: Proper HTTP status code checking (200, 302, 401 all accepted)
+#        ✅ Fixed: Added timeout controls to prevent hanging
+#        ✅ Fixed: Now ASKS user before restoring from backup (no auto-restore!)
+#        ✅ Added: Multiple validation methods (curl, wget, openssl s_client)
+#        ✅ Added: Connection refused vs connection timeout detection
+#        ✅ Added: Better error messages with specific failure reasons
+#        ✅ Added: Option to continue even if validation fails
 #
 #############################################################################################################################
 
@@ -49,7 +50,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 
@@ -61,14 +62,18 @@ error_handler() {
     local line_no=$2
     print_error "Error on line $line_no: exit code $exit_code"
     
-    # Ask if user wants to restore from backup
+    # Ask if user wants to restore from backup - NEVER auto-restore!
     if [[ -d "$BACKUP_DIR" ]]; then
         echo ""
-        print_warning "Would you like to restore from the backup taken before this step?"
-        read -p "Restore from backup? (y/n): " -n 1 -r
+        print_warning "An error occurred. A backup exists at: $BACKUP_DIR"
+        print_warning "You can restore manually later with: sudo $BACKUP_DIR/restore.sh"
+        echo ""
+        read -p "Would you like to restore from backup NOW? (y/n): " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             restore_from_backup
+        else
+            print_message "Continuing without restore. You can run the script again later."
         fi
     fi
     
@@ -110,7 +115,7 @@ print_error() {
 }
 
 #================================================================================
-# SERVICE MANAGEMENT (NEW)
+# SERVICE MANAGEMENT
 #================================================================================
 
 restart_pihole_with_verification() {
@@ -194,6 +199,200 @@ verify_certificate_files() {
     fi
     
     return $errors
+}
+
+#================================================================================
+# IMPROVED HTTPS VALIDATION (FIXED in v1.2.1)
+#================================================================================
+
+check_http_status() {
+    local url="$1"
+    local timeout=5
+    
+    # Try curl first (most reliable)
+    if command -v curl &> /dev/null; then
+        local status
+        status=$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout "$timeout" --max-time "$timeout" "$url" 2>/dev/null)
+        local curl_exit=$?
+        
+        if [[ $curl_exit -eq 0 ]]; then
+            echo "$status"
+            return 0
+        elif [[ $curl_exit -eq 7 ]]; then
+            echo "CONNECTION_REFUSED"
+            return 1
+        elif [[ $curl_exit -eq 28 ]]; then
+            echo "TIMEOUT"
+            return 1
+        else
+            echo "CURL_ERROR_$curl_exit"
+            return 1
+        fi
+    fi
+    
+    # Fallback to wget
+    if command -v wget &> /dev/null; then
+        if wget --no-check-certificate -T "$timeout" -t 1 -S --spider "$url" 2>&1 | grep -q "HTTP/"; then
+            local status
+            status=$(wget --no-check-certificate -T "$timeout" -t 1 -S --spider "$url" 2>&1 | grep "HTTP/" | awk '{print $2}' | head -1)
+            echo "$status"
+            return 0
+        else
+            echo "WGET_FAILED"
+            return 1
+        fi
+    fi
+    
+    echo "NO_TOOL"
+    return 1
+}
+
+check_tls_handshake() {
+    local host="$1"
+    local port="$2"
+    local timeout=5
+    
+    if command -v openssl &> /dev/null; then
+        # Use openssl s_client with timeout
+        if timeout "$timeout" openssl s_client -connect "$host:$port" -servername "$host" 2>&1 < /dev/null | grep -q "CONNECTED"; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+validate_https() {
+    print_step "Validating HTTPS Service"
+    
+    local max_attempts=10
+    local attempt=1
+    local success=false
+    local local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
+    
+    print_message "Testing HTTPS on port $WEB_PORT..."
+    print_message "This may take up to 30 seconds..."
+    
+    # First check if service is running
+    if ! systemctl is-active --quiet pihole-FTL; then
+        print_error "Pi-hole FTL is not running"
+        systemctl status pihole-FTL --no-pager | head -10
+        return 1
+    fi
+    
+    # Check if port is listening
+    if ! ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT.*pihole-FTL"; then
+        print_warning "Port $WEB_PORT is not listening yet"
+        ss -tlnp | grep -E ":(443|80)" || true
+    fi
+    
+    # Test endpoints with proper HTTP status checking
+    local endpoints=(
+        "https://127.0.0.1:$WEB_PORT/admin"
+        "https://localhost:$WEB_PORT/admin"
+        "https://$local_ip:$WEB_PORT/admin"
+    )
+    
+    local valid_http_codes=("200" "302" "401" "403")
+    
+    echo ""
+    print_message "Testing endpoints..."
+    
+    while [[ $attempt -le $max_attempts ]] && [[ "$success" == false ]]; do
+        for endpoint in "${endpoints[@]}"; do
+            echo -n "  Attempt $attempt: $(echo "$endpoint" | cut -d/ -f1-3)... "
+            
+            local status
+            status=$(check_http_status "$endpoint")
+            
+            # Check if status is a valid HTTP code we accept
+            local valid=false
+            for code in "${valid_http_codes[@]}"; do
+                if [[ "$status" == "$code" ]]; then
+                    valid=true
+                    break
+                fi
+            done
+            
+            if [[ "$valid" == true ]]; then
+                echo -e "${GREEN}OK (HTTP $status)${NC}"
+                success=true
+                break 2
+            elif [[ "$status" == "CONNECTION_REFUSED" ]]; then
+                echo -e "${RED}Connection refused${NC}"
+            elif [[ "$status" == "TIMEOUT" ]]; then
+                echo -e "${YELLOW}Timeout${NC}"
+            elif [[ "$status" == "000" ]]; then
+                echo -e "${YELLOW}No response${NC}"
+            else
+                echo -e "${YELLOW}HTTP $status${NC}"
+                # Accept any 2xx or 3xx status
+                if [[ "$status" =~ ^[23][0-9][0-9]$ ]]; then
+                    success=true
+                    break 2
+                fi
+            fi
+        done
+        
+        if [[ $attempt -lt $max_attempts ]]; then
+            sleep 2
+        fi
+        ((attempt++))
+    done
+    
+    echo ""
+    
+    if [[ "$success" == true ]]; then
+        print_success "✓ HTTPS validation passed"
+        
+        # Also test TLS handshake
+        print_message "Testing TLS handshake..."
+        if check_tls_handshake "127.0.0.1" "$WEB_PORT"; then
+            print_success "✓ TLS handshake successful"
+        else
+            print_warning "⚠ TLS handshake test failed (but HTTP works)"
+        fi
+        
+        return 0
+    else
+        print_error "✗ HTTPS test failed after $max_attempts attempts"
+        
+        # Diagnostic information
+        echo ""
+        print_message "Diagnostic information:"
+        echo "  • Pi-hole FTL status: $(systemctl is-active pihole-FTL)"
+        echo "  • Port $WEB_PORT listener: $(ss -tlnp | grep ":$WEB_PORT" || echo 'Not listening')"
+        echo "  • Certificate file: $(ls -la $PIHOLE_CERT 2>/dev/null || echo 'Not found')"
+        echo ""
+        
+        # Ask user what to do - NEVER auto-restore!
+        print_warning "HTTPS validation failed, but your Pi-hole might still be working."
+        print_warning "You can:"
+        echo "  1) Continue anyway (skip this check)"
+        echo "  2) Restore from backup"
+        echo "  3) Exit and troubleshoot manually"
+        echo ""
+        read -p "Choose option (1-3): " validate_choice
+        
+        case $validate_choice in
+            1)
+                print_warning "Continuing despite HTTPS validation failure"
+                return 0
+                ;;
+            2)
+                restore_from_backup
+                exit 0
+                ;;
+            3)
+                print_message "Exiting as requested. Your backup is at: $BACKUP_DIR"
+                exit 1
+                ;;
+            *)
+                print_error "Invalid choice, exiting"
+                exit 1
+                ;;
+        esac
+    fi
 }
 
 #================================================================================
@@ -427,77 +626,6 @@ verify_domain_resolution() {
 }
 
 #================================================================================
-# SERVICE VALIDATION (IMPROVED)
-#================================================================================
-
-validate_https() {
-    print_step "Validating HTTPS Service"
-    
-    local max_attempts=15
-    local attempt=1
-    local success=false
-    local local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
-    
-    print_message "Testing HTTPS on port $WEB_PORT..."
-    
-    # First check if service is running
-    if ! systemctl is-active --quiet pihole-FTL; then
-        print_error "Pi-hole FTL is not running"
-        systemctl status pihole-FTL --no-pager | head -10
-        return 1
-    fi
-    
-    # Check if port is listening
-    if ! ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT.*pihole-FTL"; then
-        print_warning "Port $WEB_PORT is not listening yet"
-        ss -tlnp | grep -E ":(443|80)" || true
-    fi
-    
-    # Try multiple endpoints
-    local endpoints=(
-        "https://127.0.0.1:$WEB_PORT/admin"
-        "https://localhost:$WEB_PORT/admin"
-        "https://$local_ip:$WEB_PORT/admin"
-    )
-    
-    print_message "Testing endpoints (this may take up to 30 seconds)..."
-    
-    while [[ $attempt -le $max_attempts ]] && [[ "$success" == false ]]; do
-        for endpoint in "${endpoints[@]}"; do
-            if curl -k -s -o /dev/null -w "%{http_code}" "$endpoint" 2>/dev/null | grep -q "200\|302"; then
-                success=true
-                print_success "✓ HTTPS working on $endpoint"
-                break 2
-            fi
-        done
-        
-        if [[ $attempt -lt $max_attempts ]]; then
-            echo -n "."
-            sleep 2
-        fi
-        ((attempt++))
-    done
-    echo ""
-    
-    if [[ "$success" == true ]]; then
-        print_success "✓ HTTPS validation passed"
-        return 0
-    else
-        print_error "✗ HTTPS test failed after $max_attempts attempts"
-        
-        # Diagnostic information
-        echo ""
-        print_message "Diagnostic information:"
-        echo "  • Pi-hole FTL status: $(systemctl is-active pihole-FTL)"
-        echo "  • Port $WEB_PORT listener: $(ss -tlnp | grep ":$WEB_PORT" || echo 'Not listening')"
-        echo "  • Certificate file: $(ls -la $PIHOLE_CERT 2>/dev/null || echo 'Not found')"
-        echo ""
-        
-        return 1
-    fi
-}
-
-#================================================================================
 # MAIN MENU
 #================================================================================
 
@@ -513,7 +641,7 @@ show_menu() {
     # Check if already installed
     if [[ -f "$INSTALL_STATE_FILE" ]]; then
         source "$INSTALL_STATE_FILE"
-        echo -e "${YELLOW}Existing installation detected:${NC}"
+        echo -e ${YELLOW}Existing installation detected:${NC}
         echo "  Domain: $INSTALLED_DOMAIN"
         echo "  Web Port: $INSTALLED_WEB_PORT"
         echo "  Installed: $INSTALLED_DATE"
@@ -669,7 +797,7 @@ get_local_ip() {
 }
 
 #================================================================================
-# CERTIFICATE FUNCTIONS (IMPROVED)
+# CERTIFICATE FUNCTIONS
 #================================================================================
 
 generate_self_signed_cert() {
@@ -903,14 +1031,19 @@ main_install() {
         print_error "Self-signed certificate failed"
         print_message "Checking certificate files..."
         ls -la /etc/pihole/tls* 2>/dev/null || echo "No certificate files found"
-        restore_from_backup
+        # Ask before restoring
+        read -p "Restore from backup? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            restore_from_backup
+        fi
         exit 1
     }
     
     # Step 5: Validate HTTPS with self-signed
     validate_https || {
-        print_error "HTTPS validation failed with self-signed cert"
-        restore_from_backup
+        # validate_https now handles user interaction
+        # If it returns non-zero, user chose to exit
         exit 1
     }
     
@@ -925,19 +1058,17 @@ main_install() {
     # Step 8: Restart with verification
     restart_pihole_with_verification || {
         print_error "Failed to restart Pi-hole after configuration"
-        restore_from_backup
+        read -p "Restore from backup? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            restore_from_backup
+        fi
         exit 1
     }
     
     # Step 9: Validate HTTPS again
     validate_https || {
-        print_error "HTTPS validation failed after configuration"
-        print_message "Would you like to restore from backup?"
-        read -p "Restore? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            restore_from_backup
-        fi
+        # validate_https now handles user interaction
         exit 1
     }
     

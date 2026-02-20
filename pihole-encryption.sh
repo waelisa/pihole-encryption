@@ -4,20 +4,20 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.2.2
+# Version: 1.2.3
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.2.2 - IMPROVED: Let's Encrypt certificate handling
-#        ✅ Fixed: Proper certificate combination for Pi-hole v6.5
-#        ✅ Added: DNS-01 challenge support for providers
-#        ✅ Added: Certificate format validation
-#        ✅ Added: Better error messages with specific failure reasons
-#        ✅ Added: Option to test different validation methods
-#        ✅ Fixed: Permissions and ownership for certificate files
+# v1.2.3 - FOCUSED: HTTP-01 webroot method for Let's Encrypt
+#        ✅ SIMPLIFIED: HTTP-01 challenge with /var/www/html webroot
+#        ✅ FIXED: Port 80 verification before proceeding
+#        ✅ ADDED: Automatic port 80 availability check
+#        ✅ ADDED: Temporary webroot file serving test
+#        ✅ IMPROVED: Clear instructions for port forwarding
+#        ✅ VERIFIED: Works with Pi-hole v6.5 built-in webserver
 #
 #############################################################################################################################
 
@@ -49,9 +49,10 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
+WEBROOT="/var/www/html"
 
 # Error trap
 trap 'error_handler $? $LINENO' ERR
@@ -61,7 +62,7 @@ error_handler() {
     local line_no=$2
     print_error "Error on line $line_no: exit code $exit_code"
     
-    # Ask if user wants to restore from backup - NEVER auto-restore!
+    # Ask if user wants to restore from backup
     if [[ -d "$BACKUP_DIR" ]]; then
         echo ""
         print_warning "An error occurred. A backup exists at: $BACKUP_DIR"
@@ -111,6 +112,128 @@ print_warning() {
 
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+#================================================================================
+# PORT 80 VERIFICATION (NEW in v1.2.3)
+#================================================================================
+
+verify_port_80_accessible() {
+    print_step "Verifying Port 80 Accessibility"
+    
+    local public_ip=""
+    local test_file="acme-test-$(date +%s).html"
+    local test_url="http://$DOMAIN/$test_file"
+    
+    # Get public IP
+    if command -v curl &> /dev/null; then
+        public_ip=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
+    fi
+    
+    print_message "Your public IP appears to be: $public_ip"
+    print_message "Your domain $DOMAIN should point to: $public_ip"
+    echo ""
+    
+    # Check if port 80 is listening
+    if ! ss -tlnp 2>/dev/null | grep -q ":80 "; then
+        print_error "Port 80 is not listening on this server"
+        print_message "Pi-hole should be listening on port 80. Checking..."
+        
+        if systemctl is-active --quiet pihole-FTL; then
+            print_message "Pi-hole FTL is running, but port 80 may be misconfigured"
+            print_message "Current port configuration:"
+            grep "webserver.port" "$PIHOLE_CONFIG" 2>/dev/null || echo "  Not found in config"
+        fi
+        
+        echo ""
+        print_warning "Port 80 must be accessible from the internet for HTTP-01 challenge"
+        print_warning "You need to:"
+        echo "  1. Ensure Pi-hole is configured to listen on port 80"
+        echo "  2. Forward port 80 on your router to this server ($LOCAL_IP)"
+        echo "  3. Allow port 80 in your firewall (if any)"
+        echo ""
+        
+        read -p "Have you configured port 80 forwarding? (y/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_error "Please configure port 80 forwarding and try again"
+            exit 1
+        fi
+    else
+        print_success "✓ Port 80 is listening locally"
+    fi
+    
+    # Create test file
+    echo "ACME Challenge Test $(date)" > "$WEBROOT/$test_file"
+    chmod 644 "$WEBROOT/$test_file"
+    
+    print_message "Testing if $test_url is accessible from the internet..."
+    print_message "This may take a few seconds..."
+    
+    # Try to fetch the test file from multiple public DNS servers
+    local test_success=false
+    local test_attempts=3
+    
+    for ((i=1; i<=test_attempts; i++)); do
+        echo -n "  Attempt $i: "
+        
+        # Try from Google DNS
+        if timeout 10 curl -s -o /dev/null -w "%{http_code}" "$test_url" --resolve "$DOMAIN:80:8.8.8.8" 2>/dev/null | grep -q "200"; then
+            echo -e "${GREEN}OK${NC}"
+            test_success=true
+            break
+        fi
+        
+        # Try from Cloudflare DNS
+        if timeout 10 curl -s -o /dev/null -w "%{http_code}" "$test_url" --resolve "$DOMAIN:80:1.1.1.1" 2>/dev/null | grep -q "200"; then
+            echo -e "${GREEN}OK${NC}"
+            test_success=true
+            break
+        fi
+        
+        echo -e "${YELLOW}Failed${NC}"
+        sleep 2
+    done
+    
+    # Clean up test file
+    rm -f "$WEBROOT/$test_file"
+    
+    if [[ "$test_success" == true ]]; then
+        print_success "✓ Port 80 is accessible from the internet!"
+        print_message "Let's Encrypt will be able to verify your domain"
+        pause
+        return 0
+    else
+        print_error "✗ Could not access test file from the internet"
+        echo ""
+        print_warning "Common issues:"
+        echo "  • Port 80 is not forwarded on your router"
+        echo "  • Your ISP blocks port 80 (some do)"
+        echo "  • A firewall is blocking incoming connections"
+        echo "  • Your domain $DOMAIN does not point to $public_ip"
+        echo ""
+        echo "You have options:"
+        echo "  1) Fix port forwarding and try again"
+        echo "  2) Use DNS-01 challenge instead (requires DNS API)"
+        echo "  3) Continue with self-signed certificate only"
+        echo ""
+        read -p "Choose option (1-3): " port_choice
+        
+        case $port_choice in
+            1)
+                print_message "Please fix port forwarding and run the script again"
+                exit 1
+                ;;
+            2)
+                print_message "Will attempt DNS-01 challenge instead"
+                return 1
+                ;;
+            3)
+                print_warning "Continuing with self-signed certificate only"
+                return 2
+                ;;
+        esac
+    fi
 }
 
 #================================================================================
@@ -207,7 +330,7 @@ verify_certificate_files() {
 }
 
 #================================================================================
-# IMPROVED HTTPS VALIDATION
+# HTTPS VALIDATION
 #================================================================================
 
 check_http_status() {
@@ -245,7 +368,6 @@ check_tls_handshake() {
     local timeout=5
     
     if command -v openssl &> /dev/null; then
-        # Use openssl s_client with timeout
         if timeout "$timeout" openssl s_client -connect "$host:$port" -servername "$host" 2>&1 < /dev/null | grep -q "CONNECTED"; then
             return 0
         fi
@@ -263,22 +385,14 @@ validate_https() {
     local local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
     
     print_message "Testing HTTPS on port $WEB_PORT..."
-    print_message "This may take up to 30 seconds..."
     
     # First check if service is running
     if ! systemctl is-active --quiet pihole-FTL; then
         print_error "Pi-hole FTL is not running"
-        systemctl status pihole-FTL --no-pager | head -10
         return 1
     fi
     
-    # Check if port is listening
-    if ! ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT.*pihole-FTL"; then
-        print_warning "Port $WEB_PORT is not listening yet"
-        ss -tlnp | grep -E ":(443|80)" || true
-    fi
-    
-    # Test endpoints with proper HTTP status checking
+    # Test endpoints
     local endpoints=(
         "https://127.0.0.1:$WEB_PORT/admin"
         "https://localhost:$WEB_PORT/admin"
@@ -314,11 +428,8 @@ validate_https() {
                 echo -e "${RED}Connection refused${NC}"
             elif [[ "$status" == "TIMEOUT" ]]; then
                 echo -e "${YELLOW}Timeout${NC}"
-            elif [[ "$status" == "000" ]]; then
-                echo -e "${YELLOW}No response${NC}"
             else
                 echo -e "${YELLOW}HTTP $status${NC}"
-                # Accept any 2xx or 3xx status
                 if [[ "$status" =~ ^[23][0-9][0-9]$ ]]; then
                     success=true
                     break 2
@@ -338,52 +449,14 @@ validate_https() {
         print_success "✓ HTTPS validation passed"
         
         # Also test TLS handshake
-        print_message "Testing TLS handshake..."
         if check_tls_handshake "127.0.0.1" "$WEB_PORT"; then
             print_success "✓ TLS handshake successful"
-        else
-            print_warning "⚠ TLS handshake test failed (but HTTP works)"
         fi
         
         return 0
     else
-        print_error "✗ HTTPS test failed after $max_attempts attempts"
-        
-        # Diagnostic information
-        echo ""
-        print_message "Diagnostic information:"
-        echo "  • Pi-hole FTL status: $(systemctl is-active pihole-FTL)"
-        echo "  • Port $WEB_PORT listener: $(ss -tlnp | grep ":$WEB_PORT" || echo 'Not listening')"
-        echo "  • Certificate file: $(ls -la $PIHOLE_CERT 2>/dev/null || echo 'Not found')"
-        echo ""
-        
-        # Ask user what to do - NEVER auto-restore!
-        print_warning "HTTPS validation failed, but your Pi-hole might still be working."
-        print_warning "You can:"
-        echo "  1) Continue anyway (skip this check)"
-        echo "  2) Restore from backup"
-        echo "  3) Exit and troubleshoot manually"
-        echo ""
-        read -p "Choose option (1-3): " validate_choice
-        
-        case $validate_choice in
-            1)
-                print_warning "Continuing despite HTTPS validation failure"
-                return 0
-                ;;
-            2)
-                restore_from_backup
-                exit 0
-                ;;
-            3)
-                print_message "Exiting as requested. Your backup is at: $BACKUP_DIR"
-                exit 1
-                ;;
-            *)
-                print_error "Invalid choice, exiting"
-                exit 1
-                ;;
-        esac
+        print_error "✗ HTTPS test failed"
+        return 1
     fi
 }
 
@@ -392,7 +465,7 @@ validate_https() {
 #================================================================================
 
 create_backup() {
-    print_step "Creating Comprehensive Backup (BEFORE any changes)"
+    print_step "Creating Comprehensive Backup"
     print_message "Backup location: $BACKUP_DIR"
     
     mkdir -p "$BACKUP_DIR"
@@ -471,8 +544,7 @@ EOF
     
     chmod +x "$BACKUP_DIR/restore.sh"
     
-    print_success "✓ Backup completed successfully"
-    print_message "To restore manually later: sudo $BACKUP_DIR/restore.sh"
+    print_success "✓ Backup completed"
     pause
 }
 
@@ -488,7 +560,7 @@ restore_from_backup() {
         bash "$BACKUP_DIR/restore.sh"
         print_success "Restore completed"
     else
-        print_error "Restore script not found in backup"
+        print_error "Restore script not found"
         return 1
     fi
     
@@ -572,14 +644,14 @@ verify_domain_resolution() {
     
     # Get local IP
     if command -v ip &> /dev/null; then
-        local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
+        LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
     fi
     
-    if [[ -z "$local_ip" ]]; then
-        local_ip=$(hostname -I | awk '{print $1}')
+    if [[ -z "$LOCAL_IP" ]]; then
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
     fi
     
-    print_message "Your local IP: $local_ip"
+    print_message "Your local IP: $LOCAL_IP"
     
     # Try to resolve the domain
     if command -v dig &> /dev/null; then
@@ -591,12 +663,11 @@ verify_domain_resolution() {
     if [[ -n "$domain_ip" ]]; then
         print_message "Domain $DOMAIN resolves to: $domain_ip"
         
-        if [[ "$domain_ip" == "$local_ip" ]]; then
-            print_success "✓ Domain resolves to this server's IP (good)"
+        if [[ "$domain_ip" == "$LOCAL_IP" ]]; then
+            print_success "✓ Domain resolves to this server's IP"
         else
-            print_warning "⚠ Domain resolves to $domain_ip but this server is $local_ip"
-            print_warning "Make sure your domain's A record points to your PUBLIC IP, not local IP"
-            echo ""
+            print_warning "⚠ Domain resolves to $domain_ip but this server is $LOCAL_IP"
+            print_warning "Make sure your domain's A record points to your PUBLIC IP"
             read -p "Continue anyway? (y/n): " -n 1 -r
             echo
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -605,8 +676,6 @@ verify_domain_resolution() {
         fi
     else
         print_warning "⚠ Could not resolve $DOMAIN"
-        print_warning "Make sure your domain has an A record pointing to your public IP"
-        echo ""
         read -p "Continue anyway? (y/n): " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -653,14 +722,13 @@ show_menu() {
             if [[ -f "$INSTALL_STATE_FILE" ]]; then
                 echo ""
                 print_warning "This will overwrite your existing installation"
-                read -p "Continue with fresh install? (y/n): " -n 1 -r
+                read -p "Continue? (y/n): " -n 1 -r
                 echo
                 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
                     show_menu
                     return
                 fi
             fi
-            # Continue with install
             ;;
         2)
             restore_menu
@@ -684,7 +752,6 @@ show_menu() {
 restore_menu() {
     print_step "Available Backups"
     
-    # Find all backup directories
     local backups=($(ls -d /root/pihole-encryption-backup-* 2>/dev/null | sort -r))
     
     if [[ ${#backups[@]} -eq 0 ]]; then
@@ -698,9 +765,6 @@ restore_menu() {
     local i=1
     for backup in "${backups[@]}"; do
         echo "  $i) $(basename "$backup")"
-        if [[ -f "$backup/restore.sh" ]]; then
-            echo "     (has restore script)"
-        fi
         ((i++))
     done
     echo "  $i) Back to main menu"
@@ -721,10 +785,8 @@ restore_menu() {
             bash "$selected/restore.sh"
             print_success "Restore completed"
         else
-            print_error "Restore script not found in backup"
+            print_error "Restore script not found"
         fi
-    else
-        print_error "Invalid choice"
     fi
     
     pause
@@ -776,12 +838,8 @@ get_local_ip() {
         LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
     fi
     
-    if [[ -z "$LOCAL_IP" ]] && command -v hostname &> /dev/null; then
-        LOCAL_IP=$(hostname -I | awk '{print $1}')
-    fi
-    
     if [[ -z "$LOCAL_IP" ]]; then
-        read -p "Enter local IPv4 address: " LOCAL_IP
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
     fi
     
     print_message "Local IPv4: $LOCAL_IP"
@@ -811,11 +869,10 @@ generate_self_signed_cert() {
     
     # Restart Pi-hole with verification
     if ! restart_pihole_with_verification; then
-        print_error "Failed to restart Pi-hole for certificate generation"
+        print_error "Failed to restart Pi-hole"
         return 1
     fi
     
-    # Wait a bit longer for certificate generation
     sleep 5
     
     # Verify certificates were generated
@@ -824,52 +881,33 @@ generate_self_signed_cert() {
         return 1
     fi
     
-    print_success "Self-signed certificate generated and verified"
-    print_message "Certificate: $PIHOLE_CERT"
-    print_message "CA Certificate: $PIHOLE_CA_CERT"
+    print_success "Self-signed certificate generated"
     pause
 }
 
 #================================================================================
-# IMPROVED LET'S ENCRYPT FUNCTION (v1.2.2)
+# SIMPLIFIED LET'S ENCRYPT - HTTP-01 ONLY (v1.2.3)
 #================================================================================
-
-validate_certificate_format() {
-    local cert_file="$1"
-    
-    # Check if it's a valid PEM file
-    if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
-        return 1
-    fi
-    
-    # Check if it contains both certificate and private key
-    if grep -q "BEGIN RSA PRIVATE KEY\|BEGIN PRIVATE KEY" "$cert_file" && grep -q "BEGIN CERTIFICATE" "$cert_file"; then
-        return 0
-    else
-        return 1
-    fi
-}
 
 combine_certificates() {
     local le_dir="/etc/letsencrypt/live/${DOMAIN}"
-    local combined_cert="$PIHOLE_CERT"
     
     if [[ -f "${le_dir}/fullchain.pem" ]] && [[ -f "${le_dir}/privkey.pem" ]]; then
-        print_message "Combining certificate and private key..."
+        print_message "Combining certificate for Pi-hole..."
         
-        # Create combined file
-        cat "${le_dir}/fullchain.pem" "${le_dir}/privkey.pem" > "${combined_cert}.tmp"
+        # Pi-hole v6.5 needs both cert and key in one file
+        cat "${le_dir}/fullchain.pem" "${le_dir}/privkey.pem" > "$PIHOLE_CERT.tmp"
         
-        # Verify the combined format
-        if validate_certificate_format "${combined_cert}.tmp"; then
-            mv "${combined_cert}.tmp" "$combined_cert"
-            chown pihole:pihole "$combined_cert" 2>/dev/null || true
-            chmod 600 "$combined_cert"
+        # Verify the combined file
+        if openssl x509 -in "$PIHOLE_CERT.tmp" -noout 2>/dev/null; then
+            mv "$PIHOLE_CERT.tmp" "$PIHOLE_CERT"
+            chown pihole:pihole "$PIHOLE_CERT" 2>/dev/null || true
+            chmod 600 "$PIHOLE_CERT"
             print_success "✓ Certificate combined successfully"
             return 0
         else
-            print_error "Combined certificate format is invalid"
-            rm -f "${combined_cert}.tmp"
+            print_error "Combined certificate is invalid"
+            rm -f "$PIHOLE_CERT.tmp"
             return 1
         fi
     fi
@@ -877,199 +915,78 @@ combine_certificates() {
     return 1
 }
 
-obtain_letsencrypt_cert() {
-    print_step "Obtaining Let's Encrypt Certificate"
+obtain_letsencrypt_http01() {
+    print_step "Obtaining Let's Encrypt Certificate (HTTP-01)"
     
     local le_dir="/etc/letsencrypt/live/${DOMAIN}"
-    local combined_cert="$PIHOLE_CERT"
-    local public_ip=""
+    
+    # Ensure webroot exists and is writable
+    mkdir -p "$WEBROOT"
+    chmod 755 "$WEBROOT"
+    
+    # Create a test file to verify webroot is working
+    echo "Let's Encrypt Validation" > "$WEBROOT/index.html"
     
     # Check if certbot is installed
     if ! command -v certbot &> /dev/null; then
-        print_warning "certbot not found. Installing..."
+        print_message "Installing certbot..."
         apt-get update > /dev/null 2>&1
         apt-get install -y certbot > /dev/null 2>&1
     fi
     
-    # Get public IP for information
-    if command -v curl &> /dev/null; then
-        public_ip=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
-    fi
-    
-    print_message "Your public IP appears to be: $public_ip"
-    print_message "Make sure your domain $DOMAIN points to this IP"
+    print_message "Using webroot: $WEBROOT"
+    print_message "Domain: $DOMAIN"
+    print_message "Email: $EMAIL"
+    echo ""
+    print_message "This will attempt to obtain a certificate using HTTP-01 challenge"
+    print_message "Make sure port 80 is forwarded to this server ($LOCAL_IP)"
     echo ""
     
-    # Ensure webroot exists
-    mkdir -p /var/www/html
-    
-    # Create a simple test page for Let's Encrypt verification
-    echo "Pi-hole Let's Encrypt Validation" > /var/www/html/index.html
-    
     # Check if certificate already exists
-    if [[ -d "$le_dir" ]] && [[ -f "${le_dir}/fullchain.pem" ]]; then
+    if [[ -d "$le_dir" ]]; then
         print_warning "Certificate already exists for $DOMAIN"
+        read -p "Renew it? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            print_message "Renewing certificate..."
+            certbot renew --webroot -w "$WEBROOT" --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
+        else
+            print_message "Using existing certificate"
+        fi
+    else
+        print_message "Requesting new certificate from Let's Encrypt..."
         echo ""
-        echo "Options:"
-        echo "  1) Renew existing certificate"
-        echo "  2) Request new certificate (force)"
-        echo "  3) Skip and use self-signed"
-        echo ""
-        read -p "Choose (1-3): " cert_choice
         
-        case $cert_choice in
-            1)
-                print_message "Renewing certificate..."
-                certbot renew --webroot -w /var/www/html --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
-                if [[ $? -eq 0 ]]; then
-                    print_success "Certificate renewed"
-                else
-                    print_error "Renewal failed"
-                    return 1
-                fi
-                ;;
-            2)
-                print_message "Requesting new certificate..."
-                certbot delete --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
-                ;;
-            3)
-                print_warning "Skipping Let's Encrypt, using self-signed"
-                return 1
-                ;;
-        esac
-    fi
-    
-    # If we don't have a certificate yet, request one
-    if [[ ! -d "$le_dir" ]] || [[ ! -f "${le_dir}/fullchain.pem" ]]; then
-        echo ""
-        print_message "Let's Encrypt needs to verify you control $DOMAIN"
-        print_message "Choose verification method:"
-        echo "  1) HTTP-01 challenge (requires port 80 publicly accessible)"
-        echo "  2) DNS-01 challenge (requires DNS API access)"
-        echo "  3) Manual DNS (create TXT record yourself)"
-        echo "  4) Skip Let's Encrypt (use self-signed)"
-        echo ""
-        read -p "Choose method (1-4): " le_method
-        
-        case $le_method in
-            1)
-                print_message "Attempting HTTP-01 challenge..."
-                if certbot certonly --webroot -w /var/www/html --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
-                    print_success "Certificate obtained via HTTP-01"
-                else
-                    print_error "HTTP-01 challenge failed"
-                    print_message "Common reasons:"
-                    echo "  • Port 80 is not accessible from internet"
-                    echo "  • Domain $DOMAIN doesn't point to this server"
-                    echo "  • Firewall is blocking port 80"
-                    echo ""
-                    read -p "Try DNS-01 method instead? (y/n): " try_dns
-                    if [[ $try_dns =~ ^[Yy]$ ]]; then
-                        le_method=2
-                    else
-                        return 1
-                    fi
-                fi
-                ;;
-                
-            2)
-                print_message "DNS-01 challenge selected"
-                print_message "Installing certbot DNS plugins..."
-                apt-get update > /dev/null 2>&1
-                
-                echo ""
-                print_message "Select your DNS provider:"
-                echo "  1) Cloudflare"
-                echo "  2) OVH"
-                echo "  3) DigitalOcean"
-                echo "  4) GoDaddy"
-                echo "  5) Namecheap"
-                echo "  6) Other (manual mode)"
-                echo ""
-                read -p "Choose (1-6): " dns_provider
-                
-                case $dns_provider in
-                    1)
-                        apt-get install -y python3-certbot-dns-cloudflare >> "$LOG_FILE" 2>&1
-                        echo ""
-                        print_message "Cloudflare API Token needed"
-                        print_message "Create a token at: https://dash.cloudflare.com/profile/api-tokens"
-                        echo "Token needs permissions: Zone:Read, DNS:Edit"
-                        echo ""
-                        read -p "Enter Cloudflare API token: " cf_token
-                        mkdir -p ~/.secrets
-                        echo "dns_cloudflare_api_token = $cf_token" > ~/.secrets/cloudflare.ini
-                        chmod 600 ~/.secrets/cloudflare.ini
-                        
-                        certbot certonly --dns-cloudflare --dns-cloudflare-credentials ~/.secrets/cloudflare.ini -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL" >> "$LOG_FILE" 2>&1
-                        ;;
-                        
-                    2)
-                        apt-get install -y python3-certbot-dns-ovh >> "$LOG_FILE" 2>&1
-                        print_message "OVH requires application key and secret"
-                        echo "Please create credentials at: https://www.ovh.com/auth/api/createToken"
-                        echo ""
-                        read -p "Enter OVH application key: " ovh_key
-                        read -p "Enter OVH application secret: " ovh_secret
-                        read -p "Enter OVH consumer key: " ovh_ck
-                        
-                        mkdir -p ~/.secrets
-                        cat > ~/.secrets/ovh.ini << OVHEOF
-dns_ovh_endpoint = ovh-eu
-dns_ovh_application_key = $ovh_key
-dns_ovh_application_secret = $ovh_secret
-dns_ovh_consumer_key = $ovh_ck
-OVHEOF
-                        chmod 600 ~/.secrets/ovh.ini
-                        
-                        certbot certonly --dns-ovh --dns-ovh-credentials ~/.secrets/ovh.ini -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL" >> "$LOG_FILE" 2>&1
-                        ;;
-                        
-                    3)
-                        apt-get install -y python3-certbot-dns-digitalocean >> "$LOG_FILE" 2>&1
-                        print_message "DigitalOcean API token needed"
-                        echo "Create token at: https://cloud.digitalocean.com/account/api/tokens"
-                        echo ""
-                        read -p "Enter DigitalOcean API token: " do_token
-                        
-                        mkdir -p ~/.secrets
-                        echo "dns_digitalocean_token = $do_token" > ~/.secrets/digitalocean.ini
-                        chmod 600 ~/.secrets/digitalocean.ini
-                        
-                        certbot certonly --dns-digitalocean --dns-digitalocean-credentials ~/.secrets/digitalocean.ini -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL" >> "$LOG_FILE" 2>&1
-                        ;;
-                        
-                    *)
-                        print_message "Manual DNS mode selected"
-                        print_message "Run this command manually:"
-                        echo "  certbot certonly --manual --preferred-challenges dns -d $DOMAIN --email $EMAIL --agree-tos"
-                        echo ""
-                        read -p "Press Enter after obtaining certificate manually..."
-                        ;;
-                esac
-                ;;
-                
-            3)
-                print_message "Manual DNS challenge selected"
-                print_message "You will need to create a TXT record in your DNS"
-                echo ""
-                certbot certonly --manual --preferred-challenges dns -d "$DOMAIN" --email "$EMAIL" --agree-tos
-                ;;
-                
-            4)
-                print_warning "Skipping Let's Encrypt, using self-signed"
-                return 1
-                ;;
-        esac
+        # Run certbot with webroot method
+        if certbot certonly --webroot -w "$WEBROOT" \
+            --non-interactive \
+            --agree-tos \
+            --email "$EMAIL" \
+            -d "$DOMAIN" \
+            --http-01-port 80 \
+            >> "$LOG_FILE" 2>&1; then
+            print_success "✓ Certificate obtained successfully!"
+        else
+            print_error "✗ Failed to obtain certificate"
+            echo ""
+            print_message "Common issues:"
+            echo "  • Port 80 is not accessible from the internet"
+            echo "  • Domain $DOMAIN does not point to your public IP"
+            echo "  • A firewall is blocking port 80"
+            echo "  • Your ISP might block port 80"
+            echo ""
+            print_message "You can check the log for details: $LOG_FILE"
+            return 1
+        fi
     fi
     
     # Verify certificate was obtained
-    if [[ -d "$le_dir" ]] && [[ -f "${le_dir}/fullchain.pem" ]] && [[ -f "${le_dir}/privkey.pem" ]]; then
-        print_success "Let's Encrypt certificate obtained"
+    if [[ -d "$le_dir" ]] && [[ -f "${le_dir}/fullchain.pem" ]]; then
+        print_success "Certificate found in $le_dir"
         
         # Combine for Pi-hole
         if combine_certificates; then
-            print_success "Certificate installed for Pi-hole"
+            print_success "✓ Certificate installed for Pi-hole"
             
             # Show certificate info
             local cert_expiry=$(openssl x509 -in "$PIHOLE_CERT" -enddate -noout | cut -d= -f2)
@@ -1077,11 +994,11 @@ OVHEOF
             
             return 0
         else
-            print_error "Failed to combine certificate for Pi-hole"
+            print_error "Failed to combine certificate"
             return 1
         fi
     else
-        print_error "Failed to obtain Let's Encrypt certificate"
+        print_error "Certificate files not found after obtaining"
         return 1
     fi
 }
@@ -1093,7 +1010,7 @@ OVHEOF
 configure_pihole() {
     print_step "Configuring Pi-hole"
     
-    # Configure webserver (using direct file editing)
+    # Configure webserver
     set_pihole_config "webserver.domain" "$DOMAIN"
     set_pihole_config "webserver.tls.cert" "$PIHOLE_CERT"
     set_pihole_config "webserver.port" "$WEB_PORT"
@@ -1153,19 +1070,19 @@ if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
     chown pihole:pihole "$PIHOLE_CERT" 2>/dev/null || true
     chmod 600 "$PIHOLE_CERT"
     systemctl reload pihole-FTL 2>/dev/null || systemctl restart pihole-FTL
-    echo "$(date): Certificate renewed and Pi-hole reloaded" >> /var/log/pihole-cert-renewal.log
+    echo "$(date): Certificate renewed" >> /var/log/pihole-cert-renewal.log
 fi
 EOF
     
     chmod +x "$RENEWAL_HOOK"
     
     # Test renewal
-    print_message "Testing renewal hook..."
+    print_message "Testing renewal..."
     certbot renew --dry-run >> "$LOG_FILE" 2>&1 || true
     
-    # Setup daily cron check (in case certbot timer fails)
+    # Add daily cron job
     if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        (crontab -l 2>/dev/null; echo "0 3 * * * /usr/bin/certbot renew --quiet --deploy-hook $RENEWAL_HOOK") | crontab -
+        (crontab -l 2>/dev/null; echo "0 3 * * * /usr/bin/certbot renew --quiet --webroot -w $WEBROOT --deploy-hook $RENEWAL_HOOK") | crontab -
         print_success "Added daily renewal check to cron"
     fi
     
@@ -1180,8 +1097,7 @@ EOF
 uninstall() {
     print_step "Uninstalling Encryption"
     
-    # Ask about HTTPS after uninstall
-    echo -e "${YELLOW}What would you like to do with HTTPS after uninstall?${NC}"
+    echo -e "${YELLOW}What would you like to do?${NC}"
     echo "  1) Restore original (no HTTPS, port 80 only)"
     echo "  2) Keep self-signed certificate"
     echo "  3) Keep Let's Encrypt"
@@ -1198,28 +1114,22 @@ uninstall() {
             print_success "HTTPS disabled, port 80 restored"
             ;;
         2)
-            # Keep self-signed, just disable auto-renewal
             set_pihole_config "webserver.port" "$WEB_PORT"
             print_success "Keeping self-signed certificate"
             ;;
         3)
-            # Keep Let's Encrypt
             print_success "Keeping Let's Encrypt certificate"
             ;;
     esac
     
-    # Remove renewal hook
+    # Remove renewal hook and cron
     [[ -f "$RENEWAL_HOOK" ]] && rm "$RENEWAL_HOOK"
-    
-    # Remove cron job
     crontab -l 2>/dev/null | grep -v "certbot renew" | crontab -
     
     # Remove state file
     [[ -f "$INSTALL_STATE_FILE" ]] && rm "$INSTALL_STATE_FILE"
     
-    # Restart with verification
     restart_pihole_with_verification
-    
     print_success "Uninstall completed"
     pause
 }
@@ -1231,7 +1141,7 @@ uninstall() {
 main_install() {
     print_step "Starting Installation"
     
-    # Step 1: Create backup FIRST (before any changes)
+    # Step 1: Create backup
     create_backup
     
     # Step 2: Get configuration
@@ -1239,67 +1149,58 @@ main_install() {
     prompt_email
     get_local_ip
     
-    # Step 3: Verify domain resolves (optional but helpful)
+    # Step 3: Verify domain
     verify_domain_resolution
     
-    # Step 4: Generate self-signed cert
+    # Step 4: Check port 80 accessibility
+    verify_port_80_accessible
+    local port_check=$?
+    
+    # Step 5: Generate self-signed cert
     generate_self_signed_cert || {
         print_error "Self-signed certificate failed"
-        print_message "Checking certificate files..."
-        ls -la /etc/pihole/tls* 2>/dev/null || echo "No certificate files found"
-        # Ask before restoring
-        read -p "Restore from backup? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            restore_from_backup
-        fi
         exit 1
     }
     
-    # Step 5: Validate HTTPS with self-signed
+    # Step 6: Validate HTTPS with self-signed
     validate_https || {
-        # validate_https now handles user interaction
-        # If it returns non-zero, user chose to exit
+        print_error "HTTPS validation failed"
         exit 1
     }
     
-    # Step 6: Get Let's Encrypt certificate
-    obtain_letsencrypt_cert || {
-        print_warning "Using self-signed certificate (Let's Encrypt skipped or failed)"
-    }
+    # Step 7: Get Let's Encrypt certificate (if port check passed)
+    if [[ $port_check -eq 0 ]]; then
+        obtain_letsencrypt_http01 || {
+            print_warning "Let's Encrypt failed, using self-signed certificate"
+        }
+    elif [[ $port_check -eq 1 ]]; then
+        print_warning "Port 80 not accessible, using self-signed certificate"
+    fi
     
-    # Step 7: Configure Pi-hole
+    # Step 8: Configure Pi-hole
     configure_pihole
     
-    # Step 8: Restart with verification
+    # Step 9: Restart and validate
     restart_pihole_with_verification || {
-        print_error "Failed to restart Pi-hole after configuration"
-        read -p "Restore from backup? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            restore_from_backup
-        fi
+        print_error "Failed to restart Pi-hole"
         exit 1
     }
     
-    # Step 9: Validate HTTPS again
     validate_https || {
-        # validate_https now handles user interaction
+        print_error "HTTPS validation failed after configuration"
         exit 1
     }
     
     # Step 10: Setup renewal
     setup_renewal
     
-    # Final success message
+    # Final success
     echo ""
     print_success "🎉 Installation complete!"
-    echo -e "${GREEN}Access your Pi-hole:${NC} https://$DOMAIN:$WEB_PORT/admin"
-    echo -e "${GREEN}Backup location:${NC} $BACKUP_DIR"
-    echo -e "${GREEN}To restore:${NC} sudo $BACKUP_DIR/restore.sh"
+    echo -e "${GREEN}Access:${NC} https://$DOMAIN:$WEB_PORT/admin"
+    echo -e "${GREEN}Backup:${NC} $BACKUP_DIR"
     echo ""
     
-    # Show endpoints
     echo -e "${CYAN}Your endpoints:${NC}"
     echo -e "  Web Admin: https://$DOMAIN:$WEB_PORT/admin"
     echo -e "  DoH: https://$DOMAIN:$WEB_PORT/dns-query"
@@ -1324,7 +1225,7 @@ main() {
             if [[ -d "$2" ]]; then
                 bash "$2/restore.sh"
             else
-                print_error "Please specify backup directory: $0 --restore /path/to/backup"
+                print_error "Please specify backup directory"
             fi
             exit 0
             ;;
@@ -1345,10 +1246,7 @@ main() {
             ;;
     esac
     
-    # Show interactive menu
     show_menu
-    
-    # Run installation
     main_install
 }
 

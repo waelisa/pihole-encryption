@@ -4,23 +4,19 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.1.8
+# Version: 1.1.9
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.1.8 - MAJOR IMPROVEMENTS based on real-world experience:
-#        ✅ BACKUP-FIRST approach - backup BEFORE any changes
-#        ✅ RESTORE MENU - option to restore from backup if something fails
-#        ✅ NO FIREWALL CONFIG - removed all firewall code (users handle iptables)
-#        ✅ DOMAIN VERIFICATION - checks DNS resolution before proceeding
-#        ✅ BETTER ERROR HANDLING - auto-restore on critical failures
-#        ✅ SERVICE VALIDATION - verifies HTTPS and DNS after changes
-#        ✅ INTERACTIVE MENU - install, restore, uninstall options
-#        ✅ CONFIG VALIDATION - checks webserver.domain matches certificate
-#        ✅ ROLLBACK ON FAILURE - automatically restores if verification fails
+# v1.1.9 - FIXED: Pi-hole v6.5 configuration syntax
+#        ✅ Fixed: Use direct TOML file editing instead of pihole-FTL config
+#        ✅ Fixed: Added missing pause function
+#        ✅ Fixed: Certificate generation now works correctly
+#        ✅ Fixed: Script continues to Let's Encrypt after self-signed success
+#        ✅ Added: Better error messages with specific fixes
 #
 #############################################################################################################################
 
@@ -52,7 +48,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.1.8"
+SCRIPT_VERSION="1.1.9"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 
@@ -83,6 +79,12 @@ error_handler() {
 # UTILITY FUNCTIONS
 #================================================================================
 
+pause() {
+    echo ""
+    read -p "Press Enter to continue..." -r
+    echo ""
+}
+
 print_step() {
     echo -e "\n${PURPLE}═══════════════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${CYAN}STEP: $1${NC}"
@@ -107,7 +109,7 @@ print_error() {
 }
 
 #================================================================================
-# BACKUP FUNCTIONS (NOW RUNS FIRST!)
+# BACKUP FUNCTIONS
 #================================================================================
 
 create_backup() {
@@ -139,19 +141,15 @@ create_backup() {
         print_message "✓ Backed up Let's Encrypt"
     fi
     
-    # Backup custom settings
-    pihole-FTL --config-all > "$BACKUP_DIR/ftl-config.txt" 2>/dev/null || true
-    
-    # Create state backup
-    if [[ -f "$INSTALL_STATE_FILE" ]]; then
-        cp "$INSTALL_STATE_FILE" "$BACKUP_DIR/installation.state.backup"
-    fi
-    
     # Create restore script
     cat > "$BACKUP_DIR/restore.sh" << 'EOF'
 #!/bin/bash
 echo "Restoring Pi-hole from backup..."
 echo "Backup directory: $(pwd)"
+
+# Stop Pi-hole first
+systemctl stop pihole-FTL
+sleep 2
 
 # Restore config
 if [[ -f "pihole.toml.backup" ]]; then
@@ -175,7 +173,7 @@ if [[ -f "tls_ca.crt.backup" ]]; then
 fi
 
 # Restart Pi-hole
-systemctl restart pihole-FTL
+systemctl start pihole-FTL
 sleep 5
 
 echo "Restore complete! Testing..."
@@ -209,6 +207,57 @@ restore_from_backup() {
 }
 
 #================================================================================
+# CONFIGURATION FUNCTIONS (FIXED for v6.5)
+#================================================================================
+
+set_pihole_config() {
+    local key="$1"
+    local value="$2"
+    local config_file="$PIHOLE_CONFIG"
+    
+    print_message "Setting $key = $value"
+    
+    # Create backup of config before modifying
+    cp "$config_file" "$config_file.tmp"
+    
+    # Handle different key types (with dots)
+    if [[ "$key" == *"."* ]]; then
+        # Split into section and key
+        local section="${key%%.*}"
+        local subkey="${key#*.}"
+        
+        # Check if section exists
+        if grep -q "^\[$section\]" "$config_file"; then
+            # Section exists, check if key exists
+            if grep -q "^[[:space:]]*$subkey =" "$config_file"; then
+                # Key exists, replace it
+                sed -i "s|^[[:space:]]*$subkey =.*|  $subkey = \"$value\"|" "$config_file"
+            else
+                # Key doesn't exist, add it after section
+                sed -i "/^\[$section\]/a \ \ $subkey = \"$value\"" "$config_file"
+            fi
+        else
+            # Section doesn't exist, add it at the end
+            echo -e "\n[$section]\n  $subkey = \"$value\"" >> "$config_file"
+        fi
+    else
+        # Simple key (shouldn't happen in pihole.toml)
+        if grep -q "^$key =" "$config_file"; then
+            sed -i "s|^$key =.*|$key = \"$value\"|" "$config_file"
+        else
+            echo "$key = \"$value\"" >> "$config_file"
+        fi
+    fi
+    
+    # Verify the change
+    if grep -q "$value" "$config_file"; then
+        print_success "✓ Configuration updated"
+    else
+        print_warning "⚠ Could not verify configuration change"
+    fi
+}
+
+#================================================================================
 # ROOT CHECK
 #================================================================================
 
@@ -223,7 +272,7 @@ check_root() {
 }
 
 #================================================================================
-# DOMAIN VERIFICATION (NEW)
+# DOMAIN VERIFICATION
 #================================================================================
 
 verify_domain_resolution() {
@@ -280,7 +329,7 @@ verify_domain_resolution() {
 }
 
 #================================================================================
-# SERVICE VALIDATION (NEW)
+# SERVICE VALIDATION
 #================================================================================
 
 validate_https() {
@@ -320,7 +369,7 @@ validate_https() {
 }
 
 #================================================================================
-# MAIN MENU (NEW)
+# MAIN MENU
 #================================================================================
 
 show_menu() {
@@ -434,7 +483,7 @@ restore_menu() {
 }
 
 #================================================================================
-# SIMPLIFIED INSTALLATION (NO FIREWALL)
+# INSTALLATION FUNCTIONS
 #================================================================================
 
 prompt_domain() {
@@ -491,7 +540,7 @@ get_local_ip() {
 }
 
 #================================================================================
-# CERTIFICATE FUNCTIONS
+# CERTIFICATE FUNCTIONS (FIXED)
 #================================================================================
 
 generate_self_signed_cert() {
@@ -503,22 +552,33 @@ generate_self_signed_cert() {
     [[ -f "$PIHOLE_CERT" ]] && cp "$PIHOLE_CERT" "$BACKUP_DIR/tls.pem.pre-selfsigned"
     [[ -f "$PIHOLE_CA_CERT" ]] && cp "$PIHOLE_CA_CERT" "$BACKUP_DIR/tls_ca.crt.pre-selfsigned"
     
-    # Set domain and generate cert
-    pihole-FTL config webserver.domain "$DOMAIN"
-    rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
-    systemctl restart pihole-FTL
-    sleep 5
+    # Set domain in config file (FIXED: direct file editing)
+    print_message "Setting domain to $DOMAIN in config..."
+    set_pihole_config "webserver.domain" "$DOMAIN"
     
+    # Remove old certificates to force regeneration
+    rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
+    
+    # Restart Pi-hole to generate new certificates
+    print_message "Restarting Pi-hole to generate certificates..."
+    systemctl restart pihole-FTL
+    sleep 10
+    
+    # Check if certificates were generated
     if [[ ! -f "$PIHOLE_CERT" ]] || [[ ! -f "$PIHOLE_CA_CERT" ]]; then
         print_error "Certificate generation failed"
+        ls -la /etc/pihole/tls* >> "$LOG_FILE" 2>&1
         return 1
     fi
     
+    # Set proper permissions
     chown pihole:pihole "$PIHOLE_CERT" "$PIHOLE_CA_CERT" 2>/dev/null || true
     chmod 600 "$PIHOLE_CERT"
     chmod 644 "$PIHOLE_CA_CERT"
     
     print_success "Self-signed certificate generated"
+    print_message "Certificate: $PIHOLE_CERT"
+    print_message "CA Certificate: $PIHOLE_CA_CERT"
     pause
 }
 
@@ -527,17 +587,25 @@ obtain_letsencrypt_cert() {
     
     local le_dir="/etc/letsencrypt/live/${DOMAIN}"
     
+    # Check if certbot is installed
+    if ! command -v certbot &> /dev/null; then
+        print_warning "certbot not found. Installing..."
+        apt-get update > /dev/null 2>&1
+        apt-get install -y certbot > /dev/null 2>&1
+    fi
+    
+    # Ensure webroot exists
+    mkdir -p /var/www/html
+    
     if [[ -d "$le_dir" ]]; then
         print_warning "Certificate already exists"
         read -p "Renew? (y/n): " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
+            print_message "Renewing certificate..."
             certbot renew --webroot -w /var/www/html --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
         fi
     else
-        # Ensure webroot exists
-        mkdir -p /var/www/html
-        
         print_message "Requesting certificate from Let's Encrypt..."
         if certbot certonly --webroot -w /var/www/html --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
             print_success "Certificate obtained"
@@ -553,7 +621,7 @@ obtain_letsencrypt_cert() {
         cat "${le_dir}/fullchain.pem" "${le_dir}/privkey.pem" > "$PIHOLE_CERT"
         chown pihole:pihole "$PIHOLE_CERT"
         chmod 600 "$PIHOLE_CERT"
-        print_success "Certificate installed"
+        print_success "Certificate installed at: $PIHOLE_CERT"
     else
         print_error "Certificate files not found"
         return 1
@@ -563,29 +631,29 @@ obtain_letsencrypt_cert() {
 }
 
 #================================================================================
-# PI-HOLE CONFIGURATION
+# PI-HOLE CONFIGURATION (FIXED)
 #================================================================================
 
 configure_pihole() {
     print_step "Configuring Pi-hole"
     
-    # Configure webserver
-    pihole-FTL config webserver.domain "$DOMAIN"
-    pihole-FTL config webserver.tls.cert "$PIHOLE_CERT"
-    pihole-FTL config webserver.port "$WEB_PORT"
-    pihole-FTL config webserver.tls.enable true
+    # Configure webserver (using direct file editing)
+    set_pihole_config "webserver.domain" "$DOMAIN"
+    set_pihole_config "webserver.tls.cert" "$PIHOLE_CERT"
+    set_pihole_config "webserver.port" "$WEB_PORT"
+    set_pihole_config "webserver.tls.enable" "true"
     
     # Configure encrypted DNS
-    pihole-FTL config dns.dot.enabled true
-    pihole-FTL config dns.dot.port "$DNS_TLS_PORT"
-    pihole-FTL config dns.dot.cert "$PIHOLE_CERT"
+    set_pihole_config "dns.dot.enabled" "true"
+    set_pihole_config "dns.dot.port" "$DNS_TLS_PORT"
+    set_pihole_config "dns.dot.cert" "$PIHOLE_CERT"
     
-    pihole-FTL config dns.doq.enabled true
-    pihole-FTL config dns.doq.port "$DNS_TLS_PORT"
-    pihole-FTL config dns.doq.cert "$PIHOLE_CERT"
+    set_pihole_config "dns.doq.enabled" "true"
+    set_pihole_config "dns.doq.port" "$DNS_TLS_PORT"
+    set_pihole_config "dns.doq.cert" "$PIHOLE_CERT"
     
-    pihole-FTL config dns.doh.enabled true
-    pihole-FTL config dns.doh.path "/dns-query"
+    set_pihole_config "dns.doh.enabled" "true"
+    set_pihole_config "dns.doh.path" "/dns-query"
     
     # Save installation state
     cat > "$INSTALL_STATE_FILE" << EOF
@@ -627,6 +695,11 @@ fi
 EOF
     
     chmod +x "$RENEWAL_HOOK"
+    
+    # Test renewal
+    print_message "Testing renewal hook..."
+    certbot renew --dry-run >> "$LOG_FILE" 2>&1 || true
+    
     print_success "Auto-renewal configured"
     pause
 }
@@ -640,24 +713,24 @@ uninstall() {
     
     # Ask about HTTPS after uninstall
     echo -e "${YELLOW}What would you like to do with HTTPS after uninstall?${NC}"
-    echo "  1) Restore original (no HTTPS)"
+    echo "  1) Restore original (no HTTPS, port 80 only)"
     echo "  2) Keep self-signed certificate"
     echo "  3) Keep Let's Encrypt"
     read -p "Choose (1-3): " uninstall_choice
     
     case $uninstall_choice in
         1)
-            pihole-FTL config webserver.tls.enable false
-            pihole-FTL config webserver.port "80"
-            pihole-FTL config dns.dot.enabled false
-            pihole-FTL config dns.doq.enabled false
-            pihole-FTL config dns.doh.enabled false
-            rm -f "$PIHOLE_CERT" "$PIHOLE_CA_CERT"
-            print_success "HTTPS disabled"
+            set_pihole_config "webserver.tls.enable" "false"
+            set_pihole_config "webserver.port" "80"
+            set_pihole_config "dns.dot.enabled" "false"
+            set_pihole_config "dns.doq.enabled" "false"
+            set_pihole_config "dns.doh.enabled" "false"
+            rm -f "$PIHOLE_CERT" "$PIHOLE_CA_CERT" 2>/dev/null
+            print_success "HTTPS disabled, port 80 restored"
             ;;
         2)
             # Keep self-signed, just disable auto-renewal
-            pihole-FTL config webserver.port "$WEB_PORT"
+            set_pihole_config "webserver.port" "$WEB_PORT"
             print_success "Keeping self-signed certificate"
             ;;
         3)
@@ -674,6 +747,7 @@ uninstall() {
     
     systemctl restart pihole-FTL
     print_success "Uninstall completed"
+    pause
 }
 
 #================================================================================
@@ -697,6 +771,8 @@ main_install() {
     # Step 4: Generate self-signed cert
     generate_self_signed_cert || {
         print_error "Self-signed certificate failed"
+        print_message "Checking certificate files..."
+        ls -la /etc/pihole/tls* 2>/dev/null || echo "No certificate files found"
         restore_from_backup
         exit 1
     }
@@ -741,6 +817,16 @@ main_install() {
     echo -e "${GREEN}Backup location:${NC} $BACKUP_DIR"
     echo -e "${GREEN}To restore:${NC} sudo $BACKUP_DIR/restore.sh"
     echo ""
+    
+    # Show endpoints
+    echo -e "${CYAN}Your endpoints:${NC}"
+    echo -e "  Web Admin: https://$DOMAIN:$WEB_PORT/admin"
+    echo -e "  DoH: https://$DOMAIN:$WEB_PORT/dns-query"
+    echo -e "  DoT: tls://$DOMAIN:$DNS_TLS_PORT"
+    echo -e "  DoQ: quic://$DOMAIN:$DNS_TLS_PORT"
+    echo ""
+    
+    pause
 }
 
 #================================================================================

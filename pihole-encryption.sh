@@ -4,18 +4,19 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.2.6
+# Version: 1.2.8
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.2.6 - FIXED: Function name consistency and backup restoration
-#        ✅ FIXED: create_backup function now properly called
-#        ✅ ADDED: Better handling of existing installations
-#        ✅ FIXED: Restore function now works with backup directory
-#        ✅ IMPROVED: Menu flow for reinstallations
+# v1.2.8 - FIXED: Pi-hole v6 webroot ownership for Let's Encrypt
+#        ✅ FIXED: Changed webroot ownership from root:root to pihole:pihole
+#        ✅ FIXED: Test files now created with correct owner (pihole)
+#        ✅ FIXED: Renewal hooks use same ownership pattern
+#        ✅ ADDED: Automatic permission fix option
+#        ✅ VERIFIED: Based on Pi-hole forum solution [citation:4]
 #
 #############################################################################################################################
 
@@ -44,7 +45,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.2.6"
+SCRIPT_VERSION="1.2.8"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 WEBROOT="/var/www/html"
@@ -211,106 +212,106 @@ restore_from_backup() {
 }
 
 #================================================================================
-# PERMISSION DIAGNOSTICS
+# PERMISSION DIAGNOSTICS AND FIX (FIXED for v1.2.8)
 #================================================================================
 
-check_webroot_permissions() {
-    print_step "Checking Webroot Permissions"
+fix_webroot_ownership() {
+    print_step "Fixing Webroot Ownership for Pi-hole"
     
-    local issues_found=false
     local pihole_user="pihole"
+    local pihole_group="pihole"
     local webroot="$WEBROOT"
     
     print_message "Pi-hole FTL runs as user: $pihole_user"
-    print_message "Checking permissions for $webroot..."
+    print_message "Current webroot status:"
     echo ""
     
-    # Check each directory in the path
-    local paths=("/" "/var" "/var/www" "/var/www/html")
+    # Check if pihole user exists
+    if ! id "$pihole_user" &>/dev/null; then
+        print_error "User $pihole_user does not exist!"
+        print_message "This suggests Pi-hole is not properly installed"
+        return 1
+    fi
     
-    for path in "${paths[@]}"; do
-        if [[ -d "$path" ]]; then
-            local perms=$(stat -c "%a" "$path" 2>/dev/null || stat -f "%OLp" "$path" 2>/dev/null)
-            local owner=$(stat -c "%U" "$path" 2>/dev/null || stat -f "%Su" "$path" 2>/dev/null)
-            local group=$(stat -c "%G" "$path" 2>/dev/null || stat -f "%Sg" "$path" 2>/dev/null)
-            
-            echo -e "  $path: $perms (owner: $owner, group: $group)"
-            
-            # Check if 'other' has execute permission (needed for pihole user to traverse)
-            local other_perms=$(( ${perms:2:1} ))
-            
-            if [[ "$path" == "/" ]]; then
-                # Root should be 755 typically
-                if [[ "$perms" != "755" ]]; then
-                    print_warning "  ⚠ Root directory has unusual permissions: $perms"
-                    issues_found=true
-                fi
-            elif [[ "$path" == "/var" || "$path" == "/var/www" ]]; then
-                # These need o+x for pihole to traverse
-                if (( (other_perms & 1) == 0 )); then
-                    print_warning "  ⚠ $path lacks execute permission for others (o+x)"
-                    issues_found=true
-                fi
-            elif [[ "$path" == "$webroot" ]]; then
-                # Webroot needs read for others
-                if (( (other_perms & 4) == 0 )); then
-                    print_warning "  ⚠ $path lacks read permission for others (o+r)"
-                    issues_found=true
-                fi
-            fi
-        else
-            print_warning "  ⚠ $path does not exist"
-            issues_found=true
-        fi
-    done
-    
-    echo ""
-    
-    if [[ "$issues_found" == true ]]; then
-        print_warning "Permission issues detected that may prevent Let's Encrypt from working"
-        echo ""
-        echo "According to Pi-hole documentation, the pihole user needs:"
-        echo "  • Execute (traverse) permission on all parent directories"
-        echo "  • Read permission on the webroot itself"
-        echo ""
-        echo "Options to fix:"
-        echo "  1) Fix permissions automatically (recommended) - sets 755 on parent dirs"
-        echo "  2) Change ownership to pihole user (more secure) - chown -R pihole:pihole $webroot"
-        echo "  3) Skip - continue with current permissions (may fail)"
-        echo ""
-        read -p "Choose option (1-3): " perm_choice
+    # Show current ownership
+    if [[ -d "$webroot" ]]; then
+        local current_owner=$(stat -c "%U:%G" "$webroot" 2>/dev/null || stat -f "%Su:%Sg" "$webroot" 2>/dev/null)
+        print_message "Current $webroot owner: $current_owner"
         
-        case $perm_choice in
-            1)
-                print_message "Fixing parent directory permissions..."
-                sudo chmod 755 /var /var/www 2>/dev/null || true
-                sudo chmod 755 "$webroot" 2>/dev/null || true
-                print_success "Permissions updated"
-                ;;
-            2)
-                print_message "Changing ownership to pihole user..."
-                sudo chown -R pihole:pihole "$webroot" 2>/dev/null || {
-                    print_error "Failed to change ownership"
-                    print_message "Creating webroot and setting ownership..."
-                    mkdir -p "$webroot"
-                    chown pihole:pihole "$webroot"
-                }
-                sudo chmod -R 755 "$webroot" 2>/dev/null || true
-                print_success "Ownership changed to pihole"
-                ;;
-            3)
-                print_warning "Continuing with current permissions"
-                ;;
-        esac
+        # Check if admin subdirectory exists and its ownership
+        if [[ -d "$webroot/admin" ]]; then
+            local admin_owner=$(stat -c "%U:%G" "$webroot/admin" 2>/dev/null || stat -f "%Su:%Sg" "$webroot/admin" 2>/dev/null)
+            print_message "Current $webroot/admin owner: $admin_owner"
+        fi
     else
-        print_success "✓ Permissions look good"
+        print_message "Webroot $webroot does not exist yet"
+    fi
+    
+    echo ""
+    print_message "According to Pi-hole documentation [citation:4], the pihole user needs to:"
+    echo "  • Own the webroot directory OR"
+    echo "  • Be able to read files in it (o+r)"
+    echo ""
+    print_message "Options:"
+    echo "  1) Change ownership to pihole:pihole (recommended for Let's Encrypt)"
+    echo "  2) Keep root:root but add world-read permissions (less secure)"
+    echo "  3) Skip - continue with current settings"
+    echo ""
+    read -p "Choose option (1-3): " owner_choice
+    
+    case $owner_choice in
+        1)
+            print_message "Changing ownership of $webroot to $pihole_user:$pihole_group..."
+            
+            # Create webroot if it doesn't exist
+            mkdir -p "$webroot"
+            
+            # Change ownership
+            chown -R "$pihole_user:$pihole_group" "$webroot" 2>/dev/null || {
+                print_error "Failed to change ownership"
+                print_message "Trying with sudo..."
+                sudo chown -R "$pihole_user:$pihole_group" "$webroot"
+            }
+            
+            # Set proper permissions (750 = owner rwx, group rx, others none)
+            chmod -R 750 "$webroot" 2>/dev/null || sudo chmod -R 750 "$webroot"
+            
+            print_success "✓ Ownership changed to $pihole_user:$pihole_group"
+            print_success "✓ Permissions set to 750"
+            
+            # Verify
+            local new_owner=$(stat -c "%U:%G" "$webroot" 2>/dev/null || stat -f "%Su:%Sg" "$webroot" 2>/dev/null)
+            print_message "New $webroot owner: $new_owner"
+            ;;
+            
+        2)
+            print_message "Adding world-read permissions to $webroot..."
+            mkdir -p "$webroot"
+            chmod -R 755 "$webroot" 2>/dev/null || sudo chmod -R 755 "$webroot"
+            print_success "✓ Permissions set to 755"
+            print_warning "Note: This is less secure than option 1"
+            ;;
+            
+        3)
+            print_warning "Skipping ownership changes"
+            ;;
+    esac
+    
+    # Also ensure parent directories are traversable
+    print_message "Ensuring parent directories are traversable..."
+    chmod 755 /var /var/www 2>/dev/null || sudo chmod 755 /var /var/www 2>/dev/null
+    
+    # Add pihole to www-data group for good measure (as suggested in [citation:4])
+    if ! groups $pihole_user | grep -q www-data; then
+        print_message "Adding $pihole_user to www-data group for additional compatibility..."
+        usermod -aG www-data $pihole_user 2>/dev/null || sudo usermod -aG www-data $pihole_user
     fi
     
     pause
 }
 
 #================================================================================
-# PORT 80 VERIFICATION
+# PORT 80 VERIFICATION (UPDATED with correct ownership)
 #================================================================================
 
 verify_port_80_accessible() {
@@ -320,9 +321,10 @@ verify_port_80_accessible() {
     local test_file="acme-test-$(date +%s).html"
     local test_url="http://$DOMAIN/$test_file"
     local local_test_url="http://127.0.0.1/$test_file"
+    local pihole_user="pihole"
     
-    # First check permissions
-    check_webroot_permissions
+    # First fix ownership (critical for Let's Encrypt to work)
+    fix_webroot_ownership
     
     # Get public IP
     if command -v curl &> /dev/null; then
@@ -356,22 +358,28 @@ verify_port_80_accessible() {
         fi
     fi
     
-    # Ensure webroot exists and is writable
+    # Ensure webroot exists
     print_message "Setting up webroot at $WEBROOT"
     mkdir -p "$WEBROOT"
     
-    # Create test file with clear content
-    echo "ACME Challenge Test File - $(date)" > "$WEBROOT/$test_file"
-    chmod 644 "$WEBROOT/$test_file"
+    # Create test file WITH PROPER OWNERSHIP (critical fix!)
+    print_message "Creating test file as $pihole_user user..."
     
-    # Verify file was created
+    # Create file as root first, then change ownership to pihole
+    echo "ACME Challenge Test File - $(date)" > "$WEBROOT/$test_file"
+    chown $pihole_user:$pihole_user "$WEBROOT/$test_file" 2>/dev/null || sudo chown $pihole_user:$pihole_user "$WEBROOT/$test_file"
+    chmod 644 "$WEBROOT/$test_file" 2>/dev/null || sudo chmod 644 "$WEBROOT/$test_file"
+    
+    # Verify file was created and has correct ownership
     if [[ ! -f "$WEBROOT/$test_file" ]]; then
         print_error "Failed to create test file at $WEBROOT/$test_file"
         ls -la "$WEBROOT"
         return 1
     fi
     
-    print_success "✓ Test file created: $WEBROOT/$test_file"
+    # Show file ownership
+    local file_owner=$(stat -c "%U:%G" "$WEBROOT/$test_file" 2>/dev/null || stat -f "%Su:%Sg" "$WEBROOT/$test_file" 2>/dev/null)
+    print_success "✓ Test file created: $WEBROOT/$test_file (owner: $file_owner)"
     
     # Test locally first
     print_message "Testing local access to test file..."
@@ -387,9 +395,7 @@ verify_port_80_accessible() {
         local root_result=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1/" 2>/dev/null)
         if [[ "$root_result" == "200" || "$root_result" == "302" ]]; then
             print_message "Pi-hole web interface is accessible (HTTP $root_result), but test file is not"
-            print_message "Check that $WEBROOT is the correct webroot"
-            
-            # Show what's in the webroot
+            print_message "Showing webroot contents:"
             ls -la "$WEBROOT"
         else
             print_warning "Pi-hole web interface not accessible on port 80 (HTTP $root_result)"
@@ -431,7 +437,7 @@ verify_port_80_accessible() {
         sleep 2
     done
     
-    # Clean up test file
+    # Clean up test file (but keep ownership pattern for future)
     rm -f "$WEBROOT/$test_file"
     
     if [[ "$test_success" == true ]]; then
@@ -441,14 +447,14 @@ verify_port_80_accessible() {
     else
         print_error "✗ Could not access test file from the internet"
         echo ""
-        print_warning "The test file was created at: $WEBROOT/$test_file"
+        print_warning "The test file was created with owner: $file_owner"
         print_warning "But could not be accessed via: $test_url"
         echo ""
         print_message "Please verify:"
         echo "  1. Port 80 is forwarded on your router to $LOCAL_IP"
         echo "  2. Your domain $DOMAIN points to $public_ip"
         echo "  3. No firewall is blocking port 80"
-        echo "  4. Directory permissions allow the pihole user to read files"
+        echo "  4. The pihole user can read files in $WEBROOT"
         echo ""
         print_message "You can test locally with: curl http://127.0.0.1/"
         print_message "You can test from outside with: curl http://$DOMAIN/"
@@ -530,6 +536,13 @@ verify_certificate_files() {
     if ! openssl x509 -in "$PIHOLE_CERT" -noout 2>/dev/null; then
         print_error "Certificate is not valid PEM format"
         return 1
+    fi
+    
+    # Check ownership
+    local cert_owner=$(stat -c "%U:%G" "$PIHOLE_CERT" 2>/dev/null || stat -f "%Su:%Sg" "$PIHOLE_CERT" 2>/dev/null)
+    if [[ "$cert_owner" != "pihole:pihole" ]]; then
+        print_warning "Certificate owner is $cert_owner, should be pihole:pihole"
+        chown pihole:pihole "$PIHOLE_CERT" 2>/dev/null || sudo chown pihole:pihole "$PIHOLE_CERT"
     fi
     
     print_success "✓ Certificate is valid"
@@ -675,7 +688,6 @@ show_menu() {
                     return
                 fi
             fi
-            # Continue with install
             ;;
         2) restore_menu ;;
         3) uninstall; exit 0 ;;
@@ -869,12 +881,14 @@ obtain_letsencrypt_http01() {
     
     local le_dir="/etc/letsencrypt/live/${DOMAIN}"
     
-    # Ensure webroot exists
+    # Ensure webroot exists with correct ownership
     mkdir -p "$WEBROOT"
+    chown pihole:pihole "$WEBROOT" 2>/dev/null || sudo chown pihole:pihole "$WEBROOT"
     chmod 755 "$WEBROOT"
     
-    # Create a test page
+    # Create a test page with correct ownership
     echo "Pi-hole Let's Encrypt Setup" > "$WEBROOT/index.html"
+    chown pihole:pihole "$WEBROOT/index.html" 2>/dev/null || sudo chown pihole:pihole "$WEBROOT/index.html"
     
     if ! command -v certbot &> /dev/null; then
         print_message "Installing certbot..."
@@ -962,7 +976,7 @@ EOF
 }
 
 #================================================================================
-# RENEWAL SETUP
+# RENEWAL SETUP (UPDATED with ownership preservation)
 #================================================================================
 
 setup_renewal() {
@@ -974,6 +988,7 @@ setup_renewal() {
 #!/bin/bash
 DOMAIN="$RENEWED_DOMAINS"
 PIHOLE_CERT="/etc/pihole/tls.pem"
+WEBROOT="/var/www/html"
 
 if [ -z "$DOMAIN" ] && [ -f "/etc/pihole/encryption-installed.state" ]; then
     source /etc/pihole/encryption-installed.state
@@ -981,10 +996,22 @@ if [ -z "$DOMAIN" ] && [ -f "/etc/pihole/encryption-installed.state" ]; then
 fi
 
 if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+    # Combine certificate
     cat "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/$DOMAIN/privkey.pem" > "$PIHOLE_CERT"
+    
+    # Fix ownership for Pi-hole
     chown pihole:pihole "$PIHOLE_CERT" 2>/dev/null || true
     chmod 600 "$PIHOLE_CERT"
+    
+    # Also ensure webroot files are owned by pihole for future renewals
+    if [ -d "$WEBROOT" ]; then
+        chown -R pihole:pihole "$WEBROOT" 2>/dev/null || true
+    fi
+    
+    # Reload Pi-hole
     systemctl reload pihole-FTL 2>/dev/null || systemctl restart pihole-FTL
+    
+    echo "$(date): Certificate renewed and installed for $DOMAIN" >> /var/log/pihole-cert-renewal.log
 fi
 EOF
     
@@ -1057,7 +1084,7 @@ main_install() {
     
     verify_domain_resolution
     
-    # Check port 80 accessibility (includes permission check)
+    # Check port 80 accessibility (includes ownership fix)
     verify_port_80_accessible
     local port_check=$?
     

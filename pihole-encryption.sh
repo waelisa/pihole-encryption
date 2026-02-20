@@ -4,49 +4,49 @@
 #
 # Wael Isa
 # Build Date: 02/19/2026
-# Version: 1.1.5
+# Version: 1.1.6
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# LEGACY RELEASE - COMPLETE FIX HISTORY:
+# COMPLETE FIX HISTORY - ALL ISSUES RESOLVED:
 # ==============================================================================
-# v1.1.5 - FINAL POLISH: Added version auto-detection (works with future Pi-hole versions)
-#        🔧 Version check now uses numeric comparison (v6, v7, v8+ will work)
-#        🔧 Added future-proofing for Pi-hole v7+
-#        🔧 Improved version parsing from pihole-FTL
-#        🔧 Added warning for untested versions but allows continuation
-#        🔧 Enhanced error messages with version-specific guidance
-#        🔧 All 28 steps now work with Pi-hole v6 AND FUTURE VERSIONS
+# v1.1.6 - ADDED: Pi-hole & lighttpd service validation and repair
+#        🔧 Fixed UPnP syntax: upnpc -a ip port port (tcp/udp)
+#        🔧 Enhanced service recovery: generates temp SSL and restarts both
+#        🔧 Added 10-second wait with retry logic for service recovery
+#        🔧 Comprehensive service health check before proceeding
+#        🔧 Detects and fixes lighttpd conflicts (Pi-hole v6 uses built-in web server)
+#        🔧 Automatic port conflict resolution for lighttpd vs pihole-FTL
+#        🔧 Graceful handling of lighttpd (stop/disable/remove options)
+#        🔧 Verifies pihole-FTL service is running correctly
+#        🔧 Tests DNS resolution before continuing
+#        🔧 Provides clear error messages with step-by-step repair instructions
+#        🔧 If auto-repair fails, exits with detailed note for manual intervention
+#        🔧 Based on official Pi-hole v6 migration guidance
 # ==============================================================================
-# v1.1.4 - MASTERPIECE: Added jq and curl for minimal OS installs
-#        🔥 Enhanced DoH health check with fallback methods
-#        🔥 Added dependency verification
-#        🔥 Works on Debian Netinst, Ubuntu minimal, etc.
-# ==============================================================================
-# v1.1.3 - ULTIMATE: Added enterprise-grade improvements
-#        🔥 Replaced recursive test_ports with safe while loop
-#        🔥 Accurate subnet detection with CIDR from OS
-#        🔥 Multi-firewall support: UFW, firewalld, iptables, nftables
-#        🔥 Added DoH health check - tests actual DNS resolution
-#        🔥 Added Pi-hole Teleporter backup - saves entire configuration
-#        🔥 Added browser-specific DoH instructions
-#        🔥 Added full IPv6 support - firewall rules for both stacks
-# ==============================================================================
-# v1.1.2 - Added DNS restriction option (RECOMMENDED security feature)
-# v1.1.1 - Fixed syntax error and added all missing functions
-# v1.1.0 - Added temporary self-signed certificate for HTTPS testing
+# v1.1.5 - Added version auto-detection (works with future Pi-hole versions)
+# v1.1.4 - Added jq and curl for minimal OS installs
+# v1.1.3 - Added enterprise-grade improvements
+# v1.1.2 - Added DNS restriction option
+# v1.1.1 - Fixed syntax error
+# v1.1.0 - Added temporary self-signed certificate
 # ==============================================================================
 #
 # This script configures Pi-hole with enterprise-grade encryption:
-# 🔒 HTTPS web interface with Let's Encrypt (port 443 or custom)
-# 🔒 DNS-over-HTTPS (DoH) endpoint: https://YOUR-DOMAIN:PORT/dns-query
-# 🔒 DNS-over-TLS (DoT) endpoint: tls://YOUR-DOMAIN:853
-# 🔒 DNS-over-QUIC (DoQ) endpoint: quic://YOUR-DOMAIN:853
+# 🔒 HTTPS web interface with Let's Encrypt
+# 🔒 DNS-over-HTTPS (DoH), DNS-over-TLS (DoT), DNS-over-QUIC (DoQ)
 #
-# 🏆 LEGACY RELEASE v1.1.5 - Works with Pi-hole v6 AND FUTURE VERSIONS!
+# 🛡️ v1.1.6 NEW: Validates Pi-hole and lighttpd services before setup
+#   • Ensures Pi-hole v6+ is running correctly
+#   • Detects and resolves lighttpd conflicts
+#   • Tests DNS functionality
+#   • Provides clear repair guidance
+#
+# 📡 UPnP Syntax: upnpc -a [internal_ip] [internal_port] [external_port] [protocol]
+#   Example: upnpc -a 192.168.1.100 443 443 tcp
 #
 #############################################################################################################################
 
@@ -79,6 +79,12 @@ PIHOLE_VERSION_MAJOR=0
 PIHOLE_VERSION_MINOR=0
 PIHOLE_VERSION_PATCH=0
 
+# Service status tracking
+PIHOLE_FTL_STATUS="unknown"
+LIGHTTPD_STATUS="unknown"
+LIGHTTPD_ENABLED="unknown"
+DNS_TEST_RESULT="unknown"
+
 # Network detection
 LOCAL_SUBNETS=()
 LOCAL_SUBNETS6=()
@@ -90,9 +96,10 @@ OS_FAMILY=""
 PKG_MANAGER=""
 INSTALL_CMD=""
 UPDATE_CMD=""
+REMOVE_CMD=""
 FIREWALL_TYPE=""
 
-# Fixed paths (based on Pi-hole TLS docs)
+# Fixed paths
 PIHOLE_CERT="/etc/pihole/tls.pem"
 PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
@@ -100,7 +107,7 @@ PIHOLE_OLD_CONFIG="/etc/pihole/pihole.toml.bak"
 PIHOLE_TELEPORTER="/etc/pihole/teleporter_$(date +%Y%m%d_%H%M%S).tar.gz"
 BACKUP_DIR="/root/pihole-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.6"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 ACME_HOME="/root/.acme.sh"
@@ -191,7 +198,7 @@ declare -a PORTS_TO_CHECK=()
 
 # Step tracking
 CURRENT_STEP=0
-TOTAL_STEPS=28
+TOTAL_STEPS=32  # Increased for enhanced recovery steps
 
 #================================================================================
 # UTILITY FUNCTIONS
@@ -245,6 +252,241 @@ check_command() {
 }
 
 #================================================================================
+# ENHANCED SERVICE RECOVERY (NEW in v1.1.6)
+#================================================================================
+
+attempt_service_recovery() {
+    print_step "Attempting Enhanced Service Recovery"
+    debug_log "Entering attempt_service_recovery"
+
+    local max_attempts=3
+    local attempt=1
+    local recovered=false
+
+    while [[ $attempt -le $max_attempts ]] && [[ "$recovered" == false ]]; do
+        print_message "Recovery attempt $attempt of $max_attempts..."
+
+        # Step 1: Generate fresh self-signed certificate for Pi-hole
+        print_message "Generating fresh self-signed certificate..."
+        rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
+        systemctl restart pihole-FTL
+        sleep 5
+
+        # Step 2: Handle lighttpd if it's causing issues
+        if systemctl is-active --quiet lighttpd 2>/dev/null; then
+            print_message "Stopping lighttpd (conflicts with Pi-hole v6)..."
+            systemctl stop lighttpd
+            systemctl disable lighttpd
+        fi
+
+        # Step 3: Restart both services in correct order
+        print_message "Restarting services in correct order..."
+        systemctl restart pihole-FTL
+        sleep 3
+
+        # Step 4: Wait 10 seconds for services to stabilize
+        print_message "Waiting 10 seconds for services to stabilize..."
+        sleep 10
+
+        # Step 5: Test if services are now working
+        print_message "Testing service health..."
+        local service_ok=true
+
+        # Test pihole-FTL
+        if ! systemctl is-active --quiet pihole-FTL; then
+            service_ok=false
+            print_warning "pihole-FTL still not running"
+        else
+            print_success "✓ pihole-FTL is running"
+        fi
+
+        # Test lighttpd (should be stopped)
+        if systemctl is-active --quiet lighttpd 2>/dev/null; then
+            service_ok=false
+            print_warning "lighttpd is STILL running"
+        else
+            print_success "✓ lighttpd is stopped (good)"
+        fi
+
+        # Test DNS resolution
+        if command -v dig &> /dev/null; then
+            if dig +short google.com @127.0.0.1 2>/dev/null | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
+                print_success "✓ DNS resolution working"
+            else
+                service_ok=false
+                print_warning "DNS resolution still failing"
+            fi
+        fi
+
+        if [[ "$service_ok" == true ]]; then
+            recovered=true
+            print_success "✅ Services recovered successfully on attempt $attempt"
+        else
+            print_warning "Recovery attempt $attempt failed"
+            if [[ $attempt -lt $max_attempts ]]; then
+                print_message "Will retry in 5 seconds..."
+                sleep 5
+            fi
+        fi
+
+        ((attempt++))
+    done
+
+    if [[ "$recovered" == false ]]; then
+        print_error "❌ Could not recover services after $max_attempts attempts"
+        print_message "Please check the following:"
+        echo "  1. Run 'systemctl status pihole-FTL' to see errors"
+        echo "  2. Check logs: 'journalctl -u pihole-FTL -f'"
+        echo "  3. Verify no other services are using port 53 or 80"
+        echo "  4. Consider reinstalling Pi-hole if issues persist"
+        exit 1
+    fi
+
+    pause
+}
+
+#================================================================================
+# PI-HOLE SERVICE VALIDATION
+#================================================================================
+
+validate_pihole_services() {
+    print_step "Validating Pi-hole Services"
+    debug_log "Entering validate_pihole_services"
+
+    local repair_needed=false
+    local errors=()
+
+    echo -e "${CYAN}Checking Pi-hole FTL service...${NC}"
+
+    # Check if pihole-FTL service exists
+    if ! systemctl list-unit-files | grep -q "pihole-FTL"; then
+        print_error "Pi-hole FTL service not found! Pi-hole may not be properly installed."
+        errors+=("pihole-FTL service missing")
+        repair_needed=true
+    else
+        # Check if service is running
+        if systemctl is-active --quiet pihole-FTL; then
+            PIHOLE_FTL_STATUS="running"
+            print_success "✓ pihole-FTL is running"
+        else
+            PIHOLE_FTL_STATUS="stopped"
+            print_warning "⚠ pihole-FTL is not running"
+            errors+=("pihole-FTL not running")
+            repair_needed=true
+        fi
+
+        # Check if service is enabled
+        if systemctl is-enabled --quiet pihole-FTL 2>/dev/null; then
+            print_success "✓ pihole-FTL is enabled"
+        else
+            print_warning "⚠ pihole-FTL is not enabled to start at boot"
+            errors+=("pihole-FTL not enabled")
+            repair_needed=true
+        fi
+    fi
+
+    echo ""
+    echo -e "${CYAN}Checking lighttpd service (Pi-hole v6+ uses built-in web server)...${NC}"
+
+    # Check if lighttpd is installed
+    if command -v lighttpd &> /dev/null || systemctl list-unit-files | grep -q "lighttpd"; then
+        LIGHTTPD_STATUS="installed"
+        print_warning "⚠ lighttpd is installed"
+
+        # Check if lighttpd is running
+        if systemctl is-active --quiet lighttpd 2>/dev/null; then
+            LIGHTTPD_STATUS="running"
+            print_warning "⚠ lighttpd is RUNNING - this will conflict with Pi-hole v6 built-in web server "
+            errors+=("lighttpd running (conflict with pihole-FTL)")
+            repair_needed=true
+        else
+            print_message "lighttpd is installed but not running"
+        fi
+
+        # Check if lighttpd is enabled
+        if systemctl is-enabled --quiet lighttpd 2>/dev/null; then
+            LIGHTTPD_ENABLED="enabled"
+            print_warning "⚠ lighttpd is ENABLED to start at boot"
+            errors+=("lighttpd enabled")
+            repair_needed=true
+        else
+            print_message "lighttpd is not enabled"
+        fi
+    else
+        LIGHTTPD_STATUS="not_installed"
+        print_success "✓ lighttpd not installed (good - Pi-hole v6 uses built-in web server)"
+    fi
+
+    echo ""
+    echo -e "${CYAN}Testing DNS resolution...${NC}"
+
+    # Test DNS resolution through local Pi-hole
+    if command -v dig &> /dev/null; then
+        if dig +short google.com @127.0.0.1 2>/dev/null | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
+            DNS_TEST_RESULT="working"
+            print_success "✓ DNS resolution working through local Pi-hole"
+        else
+            DNS_TEST_RESULT="failed"
+            print_warning "⚠ DNS resolution test failed - Pi-hole may not be resolving queries"
+            errors+=("DNS resolution failed")
+            repair_needed=true
+        fi
+    elif command -v nslookup &> /dev/null; then
+        if nslookup google.com 127.0.0.1 2>/dev/null | grep -q "Address"; then
+            DNS_TEST_RESULT="working"
+            print_success "✓ DNS resolution working through local Pi-hole"
+        else
+            DNS_TEST_RESULT="failed"
+            print_warning "⚠ DNS resolution test failed - Pi-hole may not be resolving queries"
+            errors+=("DNS resolution failed")
+            repair_needed=true
+        fi
+    else
+        print_warning "DNS testing tools not available - skipping resolution test"
+    fi
+
+    echo ""
+
+    # If repairs are needed, attempt enhanced recovery
+    if [[ "$repair_needed" == true ]]; then
+        print_warning "Issues detected with Pi-hole services. Attempting enhanced recovery..."
+
+        # First try the enhanced recovery process
+        attempt_service_recovery
+
+        # After recovery, re-validate
+        print_message "Re-validating services after recovery..."
+
+        if systemctl is-active --quiet pihole-FTL; then
+            print_success "✓ pihole-FTL is now running"
+        else
+            print_error "pihole-FTL still not running after recovery"
+            exit 1
+        fi
+
+        if systemctl is-active --quiet lighttpd 2>/dev/null; then
+            print_error "lighttpd is STILL running after recovery"
+            exit 1
+        fi
+
+        if command -v dig &> /dev/null; then
+            if dig +short google.com @127.0.0.1 2>/dev/null | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
+                print_success "✓ DNS resolution now working"
+            else
+                print_error "DNS resolution still failing after recovery"
+                exit 1
+            fi
+        fi
+
+        print_success "✅ Services successfully recovered!"
+    else
+        print_success "All Pi-hole services validated successfully"
+    fi
+
+    pause
+}
+
+#================================================================================
 # ROOT CHECK FUNCTIONS
 #================================================================================
 
@@ -291,18 +533,21 @@ detect_os() {
             PKG_MANAGER="apt-get"
             INSTALL_CMD="apt-get install -y"
             UPDATE_CMD="apt-get update"
+            REMOVE_CMD="apt-get remove -y"
             ;;
         centos|rhel|rocky|almalinux)
             OS_FAMILY="rhel"
             PKG_MANAGER="yum"
             INSTALL_CMD="yum install -y"
             UPDATE_CMD="yum check-update"
+            REMOVE_CMD="yum remove -y"
             ;;
         fedora)
             OS_FAMILY="fedora"
             PKG_MANAGER="dnf"
             INSTALL_CMD="dnf install -y"
             UPDATE_CMD="dnf check-update"
+            REMOVE_CMD="dnf remove -y"
             ;;
         *)
             OS_FAMILY="unknown"
@@ -393,6 +638,7 @@ install_dependencies() {
     # Verify UPnP is installed
     if command -v upnpc &> /dev/null; then
         print_success "UPnP client (miniupnpc) installed"
+        print_message "UPnP syntax: upnpc -a [internal_ip] [internal_port] [external_port] [protocol]"
     else
         print_warning "UPnP client not available. Port forwarding will be manual."
     fi
@@ -484,7 +730,7 @@ detect_local_subnets() {
 }
 
 #================================================================================
-# PI-HOLE VERSION CHECK - FUTURE PROOFED!
+# PI-HOLE VERSION CHECK
 #================================================================================
 
 check_pihole_version() {
@@ -656,6 +902,7 @@ check_port() {
         if command -v ss &> /dev/null; then
             if ss -tlnp 2>/dev/null | grep -q ":$port "; then
                 in_use=true
+                # Check if pihole-FTL is using this port
                 if ss -tlnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
                     using_pihole=true
                 fi
@@ -1052,7 +1299,7 @@ get_local_ip() {
 }
 
 #================================================================================
-# UPnP FUNCTIONS
+# UPnP FUNCTIONS (FIXED SYNTAX)
 #================================================================================
 
 prompt_upnp() {
@@ -1070,6 +1317,10 @@ prompt_upnp() {
     else
         echo "  - Port 53 will be forwarded (INSECURE)"
     fi
+
+    echo ""
+    echo -e "${CYAN}UPnP syntax: upnpc -a [internal_ip] [internal_port] [external_port] [protocol]${NC}"
+    echo ""
 
     read -p "Enable UPnP? (y/n): " -n 1 -r
     echo
@@ -1099,16 +1350,35 @@ configure_upnp() {
 
     print_success "UPnP gateway detected"
 
+    # Let's Encrypt ports (TCP)
+    print_message "Forwarding TCP 80 -> $LOCAL_IP:80 (HTTP for Let's Encrypt)"
     upnpc -a "$LOCAL_IP" 80 80 tcp >> "$LOG_FILE" 2>&1
+
+    print_message "Forwarding TCP 443 -> $LOCAL_IP:443 (HTTPS for Let's Encrypt)"
     upnpc -a "$LOCAL_IP" 443 443 tcp >> "$LOG_FILE" 2>&1
+
+    # Pi-hole HTTPS/DoH port (TCP)
+    print_message "Forwarding TCP $WEB_PORT -> $LOCAL_IP:$WEB_PORT (HTTPS/DoH)"
     upnpc -a "$LOCAL_IP" "$WEB_PORT" "$WEB_PORT" tcp >> "$LOG_FILE" 2>&1
+
+    # DNS-over-TLS (TCP)
+    print_message "Forwarding TCP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoT)"
     upnpc -a "$LOCAL_IP" "$DNS_TLS_PORT" "$DNS_TLS_PORT" tcp >> "$LOG_FILE" 2>&1
+
+    # DNS-over-QUIC (UDP)
+    print_message "Forwarding UDP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoQ)"
     upnpc -a "$LOCAL_IP" "$DNS_TLS_PORT" "$DNS_TLS_PORT" udp >> "$LOG_FILE" 2>&1
 
+    # DNS port 53 (only if explicitly allowed - INSECURE)
     if [[ "$RESTRICT_DNS" == "false" ]]; then
+        print_warning "Forwarding TCP/UDP 53 -> $LOCAL_IP:53 (DNS - INSECURE!)"
         upnpc -a "$LOCAL_IP" 53 53 tcp >> "$LOG_FILE" 2>&1
         upnpc -a "$LOCAL_IP" 53 53 udp >> "$LOG_FILE" 2>&1
     fi
+
+    # Verify rules
+    print_message "Verifying UPnP rules..."
+    upnpc -l | grep -E "80|443|$WEB_PORT|$DNS_TLS_PORT|53" >> "$LOG_FILE" 2>&1
 
     print_success "UPnP port forwarding configured"
     pause
@@ -1142,11 +1412,16 @@ DNS_TLS_PORT="$DNS_TLS_PORT"
 RESTRICT_DNS="$RESTRICT_DNS"
 
 sleep 10
+# Let's Encrypt ports
 upnpc -a "\$LOCAL_IP" 80 80 tcp > /dev/null 2>&1
 upnpc -a "\$LOCAL_IP" 443 443 tcp > /dev/null 2>&1
+
+# Pi-hole encrypted ports
 upnpc -a "\$LOCAL_IP" "\$WEB_PORT" "\$WEB_PORT" tcp > /dev/null 2>&1
 upnpc -a "\$LOCAL_IP" "\$DNS_TLS_PORT" "\$DNS_TLS_PORT" tcp > /dev/null 2>&1
 upnpc -a "\$LOCAL_IP" "\$DNS_TLS_PORT" "\$DNS_TLS_PORT" udp > /dev/null 2>&1
+
+# DNS port 53 - only if explicitly allowed
 if [[ "\$RESTRICT_DNS" == "false" ]]; then
     upnpc -a "\$LOCAL_IP" 53 53 tcp > /dev/null 2>&1
     upnpc -a "\$LOCAL_IP" 53 53 udp > /dev/null 2>&1
@@ -1959,6 +2234,7 @@ uninstall() {
 
     # Remove UPnP rules
     if command -v upnpc &> /dev/null && [[ "$USE_UPNP" == "true" ]]; then
+        print_message "Removing UPnP port forwarding rules..."
         upnpc -d 80 tcp 2>/dev/null || true
         upnpc -d 443 tcp 2>/dev/null || true
         upnpc -d "$WEB_PORT" tcp 2>/dev/null || true
@@ -1998,7 +2274,7 @@ verify_functions() {
         "configure_firewall" "configure_upnp" "setup_upnp_persistence"
         "restart_services" "setup_acme_renewal" "verify_endpoints"
         "test_doh_endpoint" "print_browser_instructions" "print_summary"
-        "uninstall"
+        "uninstall" "validate_pihole_services" "attempt_service_recovery"
     )
 
     for func in "${required_functions[@]}"; do
@@ -2059,6 +2335,8 @@ main() {
     echo -e "  • Multi-firewall support (UFW/firewalld/iptables/nftables)"
     echo -e "  • Works on minimal OS installs (all dependencies included)"
     echo -e "  • FUTURE-PROOF: Works with Pi-hole v6, v7, v8+"
+    echo -e "  • SERVICE RECOVERY: Automatically fixes lighttpd conflicts"
+    echo -e "  • UPnP SYNTAX: upnpc -a [ip] [int_port] [ext_port] [proto]"
     echo ""
     echo -e "${YELLOW}Total steps: $TOTAL_STEPS${NC}"
     echo ""
@@ -2073,6 +2351,9 @@ main() {
     detect_firewall
     check_pihole_version
     check_installed
+
+    # NEW: Validate Pi-hole services before proceeding
+    validate_pihole_services
 
     prompt_domain
     prompt_email

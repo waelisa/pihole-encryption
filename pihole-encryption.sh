@@ -4,19 +4,19 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.2.8
+# Version: 1.2.9
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.2.8 - FIXED: Pi-hole v6 webroot ownership for Let's Encrypt
-#        ✅ FIXED: Changed webroot ownership from root:root to pihole:pihole
-#        ✅ FIXED: Test files now created with correct owner (pihole)
-#        ✅ FIXED: Renewal hooks use same ownership pattern
-#        ✅ ADDED: Automatic permission fix option
-#        ✅ VERIFIED: Based on Pi-hole forum solution [citation:4]
+# v1.2.9 - FIXED: Pi-hole webroot serving for Let's Encrypt
+#        ✅ FIXED: Set webserver.serve_all = true in pihole.toml
+#        ✅ FIXED: Delete old acme-test files before testing
+#        ✅ FIXED: Ensure correct domain in config
+#        ✅ ADDED: Automatic config verification
+#        ✅ VERIFIED: Based on Pi-hole v6 documentation
 #
 #############################################################################################################################
 
@@ -45,7 +45,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.2.8"
+SCRIPT_VERSION="1.2.9"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 WEBROOT="/var/www/html"
@@ -212,7 +212,86 @@ restore_from_backup() {
 }
 
 #================================================================================
-# PERMISSION DIAGNOSTICS AND FIX (FIXED for v1.2.8)
+# PI-HOLE CONFIGURATION VERIFICATION (NEW in v1.2.9)
+#================================================================================
+
+verify_pihole_config() {
+    print_step "Verifying Pi-hole Configuration"
+    
+    local config_file="$PIHOLE_CONFIG"
+    local changes_made=false
+    
+    print_message "Checking Pi-hole configuration for Let's Encrypt compatibility..."
+    echo ""
+    
+    # Check if config file exists
+    if [[ ! -f "$config_file" ]]; then
+        print_error "Pi-hole config file not found: $config_file"
+        return 1
+    fi
+    
+    # 1. Check domain setting
+    print_message "Checking webserver.domain..."
+    local current_domain=$(grep -E "^[[:space:]]*domain =" "$config_file" | head -1 | sed 's/.*= //' | tr -d '"')
+    
+    if [[ "$current_domain" != "$DOMAIN" ]]; then
+        print_warning "  Domain is set to '$current_domain', should be '$DOMAIN'"
+        print_message "  Updating domain in config..."
+        sed -i "s/^[[:space:]]*domain = .*/  domain = \"$DOMAIN\"/" "$config_file"
+        changes_made=true
+        print_success "  ✓ Domain updated to $DOMAIN"
+    else
+        print_success "  ✓ Domain correctly set to $DOMAIN"
+    fi
+    
+    # 2. Check serve_all setting (CRITICAL for Let's Encrypt!)
+    print_message "Checking webserver.serve_all..."
+    local serve_all=$(grep -E "^[[:space:]]*serve_all =" "$config_file" | head -1 | sed 's/.*= //')
+    
+    if [[ "$serve_all" != "true" ]]; then
+        print_warning "  serve_all is set to '$serve_all', must be 'true' for Let's Encrypt"
+        print_message "  This setting allows Pi-hole to serve files from $WEBROOT"
+        sed -i "s/^[[:space:]]*serve_all = .*/  serve_all = true/" "$config_file"
+        changes_made=true
+        print_success "  ✓ serve_all set to true"
+    else
+        print_success "  ✓ serve_all correctly set to true"
+    fi
+    
+    # 3. Check port configuration
+    print_message "Checking webserver.port..."
+    local port_setting=$(grep -E "^[[:space:]]*port =" "$config_file" | head -1 | sed 's/.*= //' | tr -d '"')
+    
+    if [[ "$port_setting" != *"80"* ]]; then
+        print_warning "  Port 80 not in configuration, adding for Let's Encrypt..."
+        # Keep existing ports and add 80
+        local new_ports="${port_setting},80"
+        sed -i "s/^[[:space:]]*port = .*/  port = \"$new_ports\"/" "$config_file"
+        changes_made=true
+        print_success "  ✓ Port 80 added to configuration"
+    else
+        print_success "  ✓ Port 80 is in configuration"
+    fi
+    
+    # If changes were made, restart Pi-hole
+    if [[ "$changes_made" == true ]]; then
+        print_message "Configuration changes detected, restarting Pi-hole..."
+        restart_pihole_with_verification
+    else
+        print_success "✓ Pi-hole configuration is correct for Let's Encrypt"
+    fi
+    
+    # Show final config
+    echo ""
+    print_message "Current webserver configuration:"
+    grep -A 10 "^\[webserver\]" "$config_file" | head -10
+    echo ""
+    
+    pause
+}
+
+#================================================================================
+# PERMISSION AND OWNERSHIP FIX
 #================================================================================
 
 fix_webroot_ownership() {
@@ -248,7 +327,7 @@ fix_webroot_ownership() {
     fi
     
     echo ""
-    print_message "According to Pi-hole documentation [citation:4], the pihole user needs to:"
+    print_message "According to Pi-hole documentation, the pihole user needs to:"
     echo "  • Own the webroot directory OR"
     echo "  • Be able to read files in it (o+r)"
     echo ""
@@ -301,7 +380,7 @@ fix_webroot_ownership() {
     print_message "Ensuring parent directories are traversable..."
     chmod 755 /var /var/www 2>/dev/null || sudo chmod 755 /var /var/www 2>/dev/null
     
-    # Add pihole to www-data group for good measure (as suggested in [citation:4])
+    # Add pihole to www-data group for good measure
     if ! groups $pihole_user | grep -q www-data; then
         print_message "Adding $pihole_user to www-data group for additional compatibility..."
         usermod -aG www-data $pihole_user 2>/dev/null || sudo usermod -aG www-data $pihole_user
@@ -311,7 +390,7 @@ fix_webroot_ownership() {
 }
 
 #================================================================================
-# PORT 80 VERIFICATION (UPDATED with correct ownership)
+# PORT 80 VERIFICATION (UPDATED with cleanup)
 #================================================================================
 
 verify_port_80_accessible() {
@@ -323,7 +402,10 @@ verify_port_80_accessible() {
     local local_test_url="http://127.0.0.1/$test_file"
     local pihole_user="pihole"
     
-    # First fix ownership (critical for Let's Encrypt to work)
+    # First verify Pi-hole configuration (domain, serve_all, ports)
+    verify_pihole_config
+    
+    # Fix ownership
     fix_webroot_ownership
     
     # Get public IP
@@ -358,19 +440,23 @@ verify_port_80_accessible() {
         fi
     fi
     
+    # Clean up any old acme-test files (CRITICAL!)
+    print_message "Cleaning up old acme-test files..."
+    find "$WEBROOT" -name "acme-test-*.html" -type f -delete 2>/dev/null
+    print_success "✓ Old test files removed"
+    
     # Ensure webroot exists
     print_message "Setting up webroot at $WEBROOT"
     mkdir -p "$WEBROOT"
     
-    # Create test file WITH PROPER OWNERSHIP (critical fix!)
+    # Create test file WITH PROPER OWNERSHIP
     print_message "Creating test file as $pihole_user user..."
     
-    # Create file as root first, then change ownership to pihole
     echo "ACME Challenge Test File - $(date)" > "$WEBROOT/$test_file"
     chown $pihole_user:$pihole_user "$WEBROOT/$test_file" 2>/dev/null || sudo chown $pihole_user:$pihole_user "$WEBROOT/$test_file"
     chmod 644 "$WEBROOT/$test_file" 2>/dev/null || sudo chmod 644 "$WEBROOT/$test_file"
     
-    # Verify file was created and has correct ownership
+    # Verify file was created
     if [[ ! -f "$WEBROOT/$test_file" ]]; then
         print_error "Failed to create test file at $WEBROOT/$test_file"
         ls -la "$WEBROOT"
@@ -397,6 +483,10 @@ verify_port_80_accessible() {
             print_message "Pi-hole web interface is accessible (HTTP $root_result), but test file is not"
             print_message "Showing webroot contents:"
             ls -la "$WEBROOT"
+            
+            # Check serve_all setting again
+            local serve_all=$(grep -E "^[[:space:]]*serve_all =" "$PIHOLE_CONFIG" | head -1 | sed 's/.*= //')
+            print_message "Current serve_all setting: $serve_all"
         else
             print_warning "Pi-hole web interface not accessible on port 80 (HTTP $root_result)"
         fi
@@ -437,7 +527,7 @@ verify_port_80_accessible() {
         sleep 2
     done
     
-    # Clean up test file (but keep ownership pattern for future)
+    # Clean up test file
     rm -f "$WEBROOT/$test_file"
     
     if [[ "$test_success" == true ]]; then
@@ -454,7 +544,8 @@ verify_port_80_accessible() {
         echo "  1. Port 80 is forwarded on your router to $LOCAL_IP"
         echo "  2. Your domain $DOMAIN points to $public_ip"
         echo "  3. No firewall is blocking port 80"
-        echo "  4. The pihole user can read files in $WEBROOT"
+        echo "  4. Pi-hole has serve_all = true in config"
+        echo "  5. The pihole user can read files in $WEBROOT"
         echo ""
         print_message "You can test locally with: curl http://127.0.0.1/"
         print_message "You can test from outside with: curl http://$DOMAIN/"
@@ -976,7 +1067,7 @@ EOF
 }
 
 #================================================================================
-# RENEWAL SETUP (UPDATED with ownership preservation)
+# RENEWAL SETUP
 #================================================================================
 
 setup_renewal() {
@@ -1084,7 +1175,7 @@ main_install() {
     
     verify_domain_resolution
     
-    # Check port 80 accessibility (includes ownership fix)
+    # Check port 80 accessibility (includes config verification and ownership fix)
     verify_port_80_accessible
     local port_check=$?
     

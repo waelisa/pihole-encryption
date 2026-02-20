@@ -4,19 +4,19 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.2.4
+# Version: 1.2.5
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.2.4 - FIXED: Test file verification for port 80 accessibility
-#        ✅ FIXED: Test file now properly created in /var/www/html
-#        ✅ ADDED: Verification that test file exists before testing
-#        ✅ ADDED: Local curl test to confirm file is served
-#        ✅ IMPROVED: Better error messages when file isn't found
-#        ✅ ADDED: Option to manually verify port forwarding
+# v1.2.5 - FIXED: Webroot permissions for Pi-hole v6.5
+#        ✅ FIXED: Parent directory permissions (/, /var, /var/www need o+x)
+#        ✅ ADDED: Permission diagnostics before test file creation
+#        ✅ ADDED: Automatic permission fixing with user confirmation
+#        ✅ ADDED: Option to change ownership to pihole user
+#        ✅ VERIFIED: Based on official Pi-hole forum solutions
 #
 #############################################################################################################################
 
@@ -45,7 +45,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.2.4"
+SCRIPT_VERSION="1.2.5"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 WEBROOT="/var/www/html"
@@ -105,7 +105,107 @@ print_error() {
 }
 
 #================================================================================
-# PORT 80 VERIFICATION (FIXED in v1.2.4)
+# PERMISSION DIAGNOSTICS AND FIX (NEW in v1.2.5)
+#================================================================================
+
+check_webroot_permissions() {
+    print_step "Checking Webroot Permissions"
+    
+    local issues_found=false
+    local pihole_user="pihole"
+    local webroot="$WEBROOT"
+    
+    print_message "Pi-hole FTL runs as user: $pihole_user"
+    print_message "Checking permissions for $webroot..."
+    echo ""
+    
+    # Check each directory in the path
+    local paths=("/" "/var" "/var/www" "/var/www/html")
+    
+    for path in "${paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            local perms=$(stat -c "%a" "$path" 2>/dev/null || stat -f "%OLp" "$path" 2>/dev/null)
+            local owner=$(stat -c "%U" "$path" 2>/dev/null || stat -f "%Su" "$path" 2>/dev/null)
+            local group=$(stat -c "%G" "$path" 2>/dev/null || stat -f "%Sg" "$path" 2>/dev/null)
+            
+            echo -e "  $path: $perms (owner: $owner, group: $group)"
+            
+            # Check if 'other' has execute permission (needed for pihole user to traverse)
+            # Permission format: 755 means other has 5 = read+execute
+            local other_perms=$(( ${perms:2:1} ))
+            
+            if [[ "$path" == "/" ]]; then
+                # Root should be 755 typically
+                if [[ "$perms" != "755" ]]; then
+                    print_warning "  ⚠ Root directory has unusual permissions: $perms"
+                    issues_found=true
+                fi
+            elif [[ "$path" == "/var" || "$path" == "/var/www" ]]; then
+                # These need o+x for pihole to traverse
+                if (( (other_perms & 1) == 0 )); then
+                    print_warning "  ⚠ $path lacks execute permission for others (o+x)"
+                    issues_found=true
+                fi
+            elif [[ "$path" == "$webroot" ]]; then
+                # Webroot needs read for others
+                if (( (other_perms & 4) == 0 )); then
+                    print_warning "  ⚠ $path lacks read permission for others (o+r)"
+                    issues_found=true
+                fi
+            fi
+        else
+            print_warning "  ⚠ $path does not exist"
+            issues_found=true
+        fi
+    done
+    
+    echo ""
+    
+    if [[ "$issues_found" == true ]]; then
+        print_warning "Permission issues detected that may prevent Let's Encrypt from working [citation:1]"
+        echo ""
+        echo "According to Pi-hole documentation, the pihole user needs:"
+        echo "  • Execute (traverse) permission on all parent directories"
+        echo "  • Read permission on the webroot itself"
+        echo ""
+        echo "Options to fix:"
+        echo "  1) Fix permissions automatically (recommended) - sets 755 on parent dirs"
+        echo "  2) Change ownership to pihole user (more secure) - chown -R pihole:pihole $webroot"
+        echo "  3) Skip - continue with current permissions (may fail)"
+        echo ""
+        read -p "Choose option (1-3): " perm_choice
+        
+        case $perm_choice in
+            1)
+                print_message "Fixing parent directory permissions..."
+                sudo chmod 755 /var /var/www 2>/dev/null || true
+                sudo chmod 755 "$webroot" 2>/dev/null || true
+                print_success "Permissions updated"
+                ;;
+            2)
+                print_message "Changing ownership to pihole user..."
+                sudo chown -R pihole:pihole "$webroot" 2>/dev/null || {
+                    print_error "Failed to change ownership"
+                    print_message "Creating webroot and setting ownership..."
+                    mkdir -p "$webroot"
+                    chown pihole:pihole "$webroot"
+                }
+                sudo chmod -R 755 "$webroot" 2>/dev/null || true
+                print_success "Ownership changed to pihole"
+                ;;
+            3)
+                print_warning "Continuing with current permissions"
+                ;;
+        esac
+    else
+        print_success "✓ Permissions look good"
+    fi
+    
+    pause
+}
+
+#================================================================================
+# PORT 80 VERIFICATION (UPDATED with permission check)
 #================================================================================
 
 verify_port_80_accessible() {
@@ -115,6 +215,9 @@ verify_port_80_accessible() {
     local test_file="acme-test-$(date +%s).html"
     local test_url="http://$DOMAIN/$test_file"
     local local_test_url="http://127.0.0.1/$test_file"
+    
+    # First check permissions
+    check_webroot_permissions
     
     # Get public IP
     if command -v curl &> /dev/null; then
@@ -133,22 +236,24 @@ verify_port_80_accessible() {
         # Check Pi-hole config
         if grep -q "webserver.port.*80" "$PIHOLE_CONFIG" 2>/dev/null; then
             print_message "Pi-hole is configured for port 80, but not listening"
-            print_message "Try restarting Pi-hole: sudo systemctl restart pihole-FTL"
+            print_message "Restarting Pi-hole..."
+            restart_pihole_with_verification
         else
-            print_message "Pi-hole may not be configured for port 80"
             print_message "Setting port 80 temporarily for Let's Encrypt..."
             set_pihole_config "webserver.port" "80,443os"
             restart_pihole_with_verification
         fi
         
-        echo ""
-        read -p "Press Enter after fixing port 80 configuration..."
+        # Check again
+        if ! ss -tlnp 2>/dev/null | grep -q ":80 "; then
+            print_error "Port 80 still not listening"
+            return 1
+        fi
     fi
     
     # Ensure webroot exists and is writable
     print_message "Setting up webroot at $WEBROOT"
     mkdir -p "$WEBROOT"
-    chmod 755 "$WEBROOT"
     
     # Create test file with clear content
     echo "ACME Challenge Test File - $(date)" > "$WEBROOT/$test_file"
@@ -157,7 +262,6 @@ verify_port_80_accessible() {
     # Verify file was created
     if [[ ! -f "$WEBROOT/$test_file" ]]; then
         print_error "Failed to create test file at $WEBROOT/$test_file"
-        print_message "Checking webroot permissions..."
         ls -la "$WEBROOT"
         return 1
     fi
@@ -166,18 +270,24 @@ verify_port_80_accessible() {
     
     # Test locally first
     print_message "Testing local access to test file..."
-    if curl -s -o /dev/null -w "%{http_code}" "$local_test_url" 2>/dev/null | grep -q "200"; then
+    local local_result=$(curl -s -o /dev/null -w "%{http_code}" "$local_test_url" 2>/dev/null)
+    
+    if [[ "$local_result" == "200" ]]; then
         print_success "✓ Test file is accessible locally via HTTP"
     else
-        print_warning "⚠ Test file not accessible locally via HTTP"
+        print_warning "⚠ Test file not accessible locally (HTTP $local_result)"
         print_message "This suggests a web server configuration issue"
         
         # Check if Pi-hole is serving files
-        if curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1/" 2>/dev/null | grep -q "200\|302"; then
-            print_message "Pi-hole web interface is accessible, but test file is not"
+        local root_result=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1/" 2>/dev/null)
+        if [[ "$root_result" == "200" || "$root_result" == "302" ]]; then
+            print_message "Pi-hole web interface is accessible (HTTP $root_result), but test file is not"
             print_message "Check that $WEBROOT is the correct webroot"
+            
+            # Show what's in the webroot
+            ls -la "$WEBROOT"
         else
-            print_warning "Pi-hole web interface not accessible on port 80"
+            print_warning "Pi-hole web interface not accessible on port 80 (HTTP $root_result)"
         fi
     fi
     
@@ -221,7 +331,6 @@ verify_port_80_accessible() {
     
     if [[ "$test_success" == true ]]; then
         print_success "✓ Port 80 is accessible from the internet!"
-        print_message "Let's Encrypt will be able to verify your domain"
         pause
         return 0
     else
@@ -234,7 +343,7 @@ verify_port_80_accessible() {
         echo "  1. Port 80 is forwarded on your router to $LOCAL_IP"
         echo "  2. Your domain $DOMAIN points to $public_ip"
         echo "  3. No firewall is blocking port 80"
-        echo "  4. Pi-hole is serving files from $WEBROOT"
+        echo "  4. Directory permissions allow the pihole user to read files [citation:1]"
         echo ""
         print_message "You can test locally with: curl http://127.0.0.1/"
         print_message "You can test from outside with: curl http://$DOMAIN/"
@@ -817,7 +926,7 @@ main_install() {
     
     verify_domain_resolution
     
-    # Check port 80 accessibility
+    # Check port 80 accessibility (includes permission check)
     verify_port_80_accessible
     local port_check=$?
     

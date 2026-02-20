@@ -4,19 +4,20 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.1.9
+# Version: 1.2.0
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.1.9 - FIXED: Pi-hole v6.5 configuration syntax
-#        ✅ Fixed: Use direct TOML file editing instead of pihole-FTL config
-#        ✅ Fixed: Added missing pause function
-#        ✅ Fixed: Certificate generation now works correctly
-#        ✅ Fixed: Script continues to Let's Encrypt after self-signed success
-#        ✅ Added: Better error messages with specific fixes
+# v1.2.0 - FIXED: HTTPS validation after self-signed cert generation
+#        ✅ Fixed: Proper service restart with verification
+#        ✅ Added: Certificate verification before HTTPS test
+#        ✅ Added: Multiple restart attempts with increasing delays
+#        ✅ Added: Port binding verification
+#        ✅ Added: Process check to ensure FTL is running
+#        ✅ Fixed: Better error messages with specific failure reasons
 #
 #############################################################################################################################
 
@@ -48,7 +49,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.1.9"
+SCRIPT_VERSION="1.2.0"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 
@@ -109,6 +110,93 @@ print_error() {
 }
 
 #================================================================================
+# SERVICE MANAGEMENT (NEW)
+#================================================================================
+
+restart_pihole_with_verification() {
+    local max_attempts=3
+    local attempt=1
+    local wait_time=5
+    
+    print_message "Restarting Pi-hole FTL service..."
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        # Stop service
+        systemctl stop pihole-FTL
+        sleep 2
+        
+        # Kill any remaining processes (just in case)
+        pkill -f pihole-FTL 2>/dev/null || true
+        sleep 2
+        
+        # Start service
+        systemctl start pihole-FTL
+        sleep $wait_time
+        
+        # Check if service is running
+        if systemctl is-active --quiet pihole-FTL; then
+            print_success "✓ Pi-hole FTL is running (attempt $attempt)"
+            
+            # Check if port is listening
+            if ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT.*pihole-FTL"; then
+                print_success "✓ Port $WEB_PORT is listening"
+                return 0
+            else
+                print_warning "⚠ Port $WEB_PORT not listening yet (attempt $attempt)"
+            fi
+        else
+            print_warning "⚠ Pi-hole FTL failed to start (attempt $attempt)"
+        fi
+        
+        # Increase wait time for next attempt
+        wait_time=$((wait_time + 5))
+        ((attempt++))
+    done
+    
+    print_error "Failed to restart Pi-hole FTL after $max_attempts attempts"
+    return 1
+}
+
+verify_certificate_files() {
+    print_message "Verifying certificate files..."
+    
+    local errors=0
+    
+    # Check if cert files exist
+    if [[ ! -f "$PIHOLE_CERT" ]]; then
+        print_error "Certificate file missing: $PIHOLE_CERT"
+        ((errors++))
+    else
+        local size=$(stat -c%s "$PIHOLE_CERT" 2>/dev/null || stat -f%z "$PIHOLE_CERT" 2>/dev/null)
+        print_message "Certificate size: $size bytes"
+        if [[ $size -lt 100 ]]; then
+            print_error "Certificate file too small (likely invalid)"
+            ((errors++))
+        else
+            print_success "✓ Certificate file exists and has valid size"
+        fi
+    fi
+    
+    if [[ ! -f "$PIHOLE_CA_CERT" ]]; then
+        print_error "CA certificate file missing: $PIHOLE_CA_CERT"
+        ((errors++))
+    else
+        print_success "✓ CA certificate file exists"
+    fi
+    
+    # Check permissions
+    if [[ -f "$PIHOLE_CERT" ]]; then
+        local perms=$(stat -c "%a" "$PIHOLE_CERT" 2>/dev/null || stat -f "%OLp" "$PIHOLE_CERT" 2>/dev/null)
+        if [[ "$perms" != "600" ]]; then
+            print_warning "Fixing certificate permissions (was $perms, should be 600)"
+            chmod 600 "$PIHOLE_CERT"
+        fi
+    fi
+    
+    return $errors
+}
+
+#================================================================================
 # BACKUP FUNCTIONS
 #================================================================================
 
@@ -149,6 +237,8 @@ echo "Backup directory: $(pwd)"
 
 # Stop Pi-hole first
 systemctl stop pihole-FTL
+sleep 3
+pkill -f pihole-FTL 2>/dev/null || true
 sleep 2
 
 # Restore config
@@ -176,8 +266,16 @@ fi
 systemctl start pihole-FTL
 sleep 5
 
-echo "Restore complete! Testing..."
-curl -k https://localhost:443/admin/ -I
+# Verify restore
+if systemctl is-active --quiet pihole-FTL; then
+    echo "✓ Pi-hole FTL is running"
+    echo ""
+    echo "Testing HTTPS..."
+    curl -k https://localhost:443/admin/ -I
+else
+    echo "⚠ Pi-hole FTL failed to start"
+    systemctl status pihole-FTL --no-pager
+fi
 EOF
     
     chmod +x "$BACKUP_DIR/restore.sh"
@@ -207,7 +305,7 @@ restore_from_backup() {
 }
 
 #================================================================================
-# CONFIGURATION FUNCTIONS (FIXED for v6.5)
+# CONFIGURATION FUNCTIONS
 #================================================================================
 
 set_pihole_config() {
@@ -329,43 +427,74 @@ verify_domain_resolution() {
 }
 
 #================================================================================
-# SERVICE VALIDATION
+# SERVICE VALIDATION (IMPROVED)
 #================================================================================
 
 validate_https() {
     print_step "Validating HTTPS Service"
     
-    local max_attempts=12
+    local max_attempts=15
     local attempt=1
     local success=false
+    local local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
     
     print_message "Testing HTTPS on port $WEB_PORT..."
     
-    while [[ $attempt -le $max_attempts ]]; do
-        if curl -k -s -o /dev/null -w "%{http_code}" "https://localhost:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
-            success=true
-            break
-        fi
-        sleep 2
-        ((attempt++))
-    done
-    
-    if [[ "$success" == true ]]; then
-        print_success "✓ HTTPS is working on localhost"
-    else
-        print_error "✗ HTTPS test failed"
+    # First check if service is running
+    if ! systemctl is-active --quiet pihole-FTL; then
+        print_error "Pi-hole FTL is not running"
+        systemctl status pihole-FTL --no-pager | head -10
         return 1
     fi
     
-    # Test via IP
-    local local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
-    if curl -k -s -o /dev/null -w "%{http_code}" "https://$local_ip:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
-        print_success "✓ HTTPS is working via IP ($local_ip)"
-    else
-        print_warning "⚠ HTTPS via IP test failed - check your network"
+    # Check if port is listening
+    if ! ss -tlnp 2>/dev/null | grep -q ":$WEB_PORT.*pihole-FTL"; then
+        print_warning "Port $WEB_PORT is not listening yet"
+        ss -tlnp | grep -E ":(443|80)" || true
     fi
     
-    pause
+    # Try multiple endpoints
+    local endpoints=(
+        "https://127.0.0.1:$WEB_PORT/admin"
+        "https://localhost:$WEB_PORT/admin"
+        "https://$local_ip:$WEB_PORT/admin"
+    )
+    
+    print_message "Testing endpoints (this may take up to 30 seconds)..."
+    
+    while [[ $attempt -le $max_attempts ]] && [[ "$success" == false ]]; do
+        for endpoint in "${endpoints[@]}"; do
+            if curl -k -s -o /dev/null -w "%{http_code}" "$endpoint" 2>/dev/null | grep -q "200\|302"; then
+                success=true
+                print_success "✓ HTTPS working on $endpoint"
+                break 2
+            fi
+        done
+        
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo -n "."
+            sleep 2
+        fi
+        ((attempt++))
+    done
+    echo ""
+    
+    if [[ "$success" == true ]]; then
+        print_success "✓ HTTPS validation passed"
+        return 0
+    else
+        print_error "✗ HTTPS test failed after $max_attempts attempts"
+        
+        # Diagnostic information
+        echo ""
+        print_message "Diagnostic information:"
+        echo "  • Pi-hole FTL status: $(systemctl is-active pihole-FTL)"
+        echo "  • Port $WEB_PORT listener: $(ss -tlnp | grep ":$WEB_PORT" || echo 'Not listening')"
+        echo "  • Certificate file: $(ls -la $PIHOLE_CERT 2>/dev/null || echo 'Not found')"
+        echo ""
+        
+        return 1
+    fi
 }
 
 #================================================================================
@@ -540,7 +669,7 @@ get_local_ip() {
 }
 
 #================================================================================
-# CERTIFICATE FUNCTIONS (FIXED)
+# CERTIFICATE FUNCTIONS (IMPROVED)
 #================================================================================
 
 generate_self_signed_cert() {
@@ -552,31 +681,30 @@ generate_self_signed_cert() {
     [[ -f "$PIHOLE_CERT" ]] && cp "$PIHOLE_CERT" "$BACKUP_DIR/tls.pem.pre-selfsigned"
     [[ -f "$PIHOLE_CA_CERT" ]] && cp "$PIHOLE_CA_CERT" "$BACKUP_DIR/tls_ca.crt.pre-selfsigned"
     
-    # Set domain in config file (FIXED: direct file editing)
+    # Set domain in config file
     print_message "Setting domain to $DOMAIN in config..."
     set_pihole_config "webserver.domain" "$DOMAIN"
     
     # Remove old certificates to force regeneration
     rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
+    print_message "Removed old certificate files"
     
-    # Restart Pi-hole to generate new certificates
-    print_message "Restarting Pi-hole to generate certificates..."
-    systemctl restart pihole-FTL
-    sleep 10
-    
-    # Check if certificates were generated
-    if [[ ! -f "$PIHOLE_CERT" ]] || [[ ! -f "$PIHOLE_CA_CERT" ]]; then
-        print_error "Certificate generation failed"
-        ls -la /etc/pihole/tls* >> "$LOG_FILE" 2>&1
+    # Restart Pi-hole with verification
+    if ! restart_pihole_with_verification; then
+        print_error "Failed to restart Pi-hole for certificate generation"
         return 1
     fi
     
-    # Set proper permissions
-    chown pihole:pihole "$PIHOLE_CERT" "$PIHOLE_CA_CERT" 2>/dev/null || true
-    chmod 600 "$PIHOLE_CERT"
-    chmod 644 "$PIHOLE_CA_CERT"
+    # Wait a bit longer for certificate generation
+    sleep 5
     
-    print_success "Self-signed certificate generated"
+    # Verify certificates were generated
+    if ! verify_certificate_files; then
+        print_error "Certificate verification failed"
+        return 1
+    fi
+    
+    print_success "Self-signed certificate generated and verified"
     print_message "Certificate: $PIHOLE_CERT"
     print_message "CA Certificate: $PIHOLE_CA_CERT"
     pause
@@ -631,7 +759,7 @@ obtain_letsencrypt_cert() {
 }
 
 #================================================================================
-# PI-HOLE CONFIGURATION (FIXED)
+# PI-HOLE CONFIGURATION
 #================================================================================
 
 configure_pihole() {
@@ -745,7 +873,9 @@ uninstall() {
     # Remove state file
     [[ -f "$INSTALL_STATE_FILE" ]] && rm "$INSTALL_STATE_FILE"
     
-    systemctl restart pihole-FTL
+    # Restart with verification
+    restart_pihole_with_verification
+    
     print_success "Uninstall completed"
     pause
 }
@@ -792,10 +922,14 @@ main_install() {
     # Step 7: Configure Pi-hole
     configure_pihole
     
-    # Step 8: Restart and validate
-    systemctl restart pihole-FTL
-    sleep 5
+    # Step 8: Restart with verification
+    restart_pihole_with_verification || {
+        print_error "Failed to restart Pi-hole after configuration"
+        restore_from_backup
+        exit 1
+    }
     
+    # Step 9: Validate HTTPS again
     validate_https || {
         print_error "HTTPS validation failed after configuration"
         print_message "Would you like to restore from backup?"
@@ -807,7 +941,7 @@ main_install() {
         exit 1
     }
     
-    # Step 9: Setup renewal
+    # Step 10: Setup renewal
     setup_renewal
     
     # Final success message

@@ -4,17 +4,16 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.3.3
+# Version: 1.3.4
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.3.3 - FIXED: Domain value extraction now strips inline comments
-#        ✅ FIXED: get_toml_value removes trailing # comments
-#        ✅ FIXED: Configuration comparison now works correctly
-#        ✅ VERIFIED: Handles lines like domain = "pi.hole" ### comment
+# v1.3.4 - REMOVED: Interactive webroot ownership step (user confirmed it's already correct)
+#        ✅ CLEANER: No unnecessary prompts
+#        ✅ STREAMLINED: Faster installation
 #
 #############################################################################################################################
 
@@ -29,7 +28,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PU
 DOMAIN=""; EMAIL=""; WEB_PORT="443"; DNS_TLS_PORT="853"; LOCAL_IP=""
 PIHOLE_CERT="/etc/pihole/tls.pem"; PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"; PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="/var/log/pihole-encryption-setup.log"; SCRIPT_VERSION="1.3.3"
+LOG_FILE="/var/log/pihole-encryption-setup.log"; SCRIPT_VERSION="1.3.4"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"; WEBROOT="/var/www/html"
 
@@ -83,7 +82,7 @@ EOF
     pause
 }
 
-# --- TOML Configuration Functions (FIXED with heredocs) ---
+# --- TOML Configuration Functions ---
 set_toml_value() {
     local config_file="$1"; local section="$2"; local key="$3"; local value="$4"
     local temp_file="${config_file}.tmp"; local backup_file="${config_file}.bak"
@@ -111,7 +110,6 @@ AWK
     fi
 }
 
-# FIXED: Now strips inline comments (anything after a #) from the extracted value
 get_toml_value() {
     local config_file="$1"; local section="$2"; local key="$3"
     awk -v s="$section" -v k="$key" "$(cat << 'AWK'
@@ -119,14 +117,10 @@ get_toml_value() {
     $0 ~ "^\\[" s "\\]" { in_section = 1; next }
     in_section == 1 && /^\[/ { in_section = 0 }
     in_section == 1 && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
-        # Extract value: remove leading spaces, key, and equals
         sub(/^[[:space:]]*[^=]*=[[:space:]]*/, "")
-        # Remove surrounding quotes
         gsub(/^"|"$/, "")
         gsub(/^'"'"'|'"'"'$/, "")
-        # Remove trailing comment (anything after #)
         sub(/#.*$/, "")
-        # Trim spaces
         gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
         exit
@@ -201,26 +195,6 @@ verify_pihole_config() {
     echo ""; print_message "Current [webserver] section:"; sed -n '/^\[webserver\]/,/^\[/p' "$config_file" | head -10; echo ""; pause
 }
 
-# --- Webroot Ownership Fix ---
-fix_webroot_ownership() {
-    print_step "Ensuring Webroot Accessibility for Pi-hole"
-    local pihole_user="pihole"; local webroot="$WEBROOT"
-    if ! id "$pihole_user" &>/dev/null; then print_error "User '$pihole_user' not found."; return 1; fi
-    mkdir -p "$webroot"
-    local current_owner=$(stat -c "%U:%G" "$webroot" 2>/dev/null || stat -f "%Su:%Sg" "$webroot" 2>/dev/null)
-    print_message "Webroot: $webroot (Owner: $current_owner)"; echo ""
-    echo "Options:"; echo "  1) Change ownership to pihole:pihole (Recommended)"; echo "  2) Keep current owner but set permissions to 755 (Less secure)"; echo "  3) Skip"
-    read -p "Choose option (1-3): " owner_choice
-    case $owner_choice in
-        1) print_message "Changing ownership to pihole:pihole..." && chown -R "$pihole_user:$pihole_user" "$webroot" 2>/dev/null || sudo chown -R "$pihole_user:$pihole_user" "$webroot" && chmod -R 755 "$webroot" 2>/dev/null || sudo chmod -R 755 "$webroot" && print_success "✓ Ownership changed to pihole:pihole" ;;
-        2) print_message "Setting permissions to 755..." && chmod -R 755 "$webroot" 2>/dev/null || sudo chmod -R 755 "$webroot" && print_success "✓ Permissions set to 755" ;;
-        3) print_warning "Skipping ownership changes" ;;
-    esac
-    chmod 755 /var /var/www 2>/dev/null || sudo chmod 755 /var /var/www 2>/dev/null
-    if ! groups $pihole_user | grep -q www-data; then usermod -aG www-data $pihole_user 2>/dev/null || sudo usermod -aG www-data $pihole_user; fi
-    pause
-}
-
 # --- Port 80 Verification ---
 verify_port_80_accessible() {
     print_step "Verifying External Access on Port 80"
@@ -230,7 +204,8 @@ verify_port_80_accessible() {
     if ! ss -tlnp 2>/dev/null | grep -q ":80 "; then print_error "Port 80 not listening locally."; return 1; fi
     find "$WEBROOT" -name "acme-test-*.html" -type f -delete 2>/dev/null
     echo "ACME Test $(date)" > "$WEBROOT/$test_file"; chmod 644 "$WEBROOT/$test_file"
-    chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null || sudo chown pihole:pihole "$WEBROOT/$test_file"
+    # Ensure correct ownership (pihole user) but don't prompt
+    chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null || sudo chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null
     if ! curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1/$test_file" | grep -q "200"; then
         print_warning "⚠ Test file not accessible locally."; ls -la "$WEBROOT"; rm -f "$WEBROOT/$test_file"; return 1
     fi
@@ -394,7 +369,7 @@ main_install() {
     fi
     create_backup
     verify_pihole_config
-    fix_webroot_ownership
+    # Webroot ownership step removed as per user request (already correct)
     verify_port_80_accessible; local port_status=$?
     generate_self_signed_cert || exit 1
     validate_https || exit 1

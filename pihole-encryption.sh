@@ -3,50 +3,24 @@
 # The MIT License (MIT)
 #
 # Wael Isa
-# Build Date: 02/19/2026
-# Version: 1.1.6
+# Build Date: 02/20/2026
+# Version: 1.1.8
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# COMPLETE FIX HISTORY - ALL ISSUES RESOLVED:
-# ==============================================================================
-# v1.1.6 - ADDED: Pi-hole & lighttpd service validation and repair
-#        🔧 Fixed UPnP syntax: upnpc -a ip port port (tcp/udp)
-#        🔧 Enhanced service recovery: generates temp SSL and restarts both
-#        🔧 Added 10-second wait with retry logic for service recovery
-#        🔧 Comprehensive service health check before proceeding
-#        🔧 Detects and fixes lighttpd conflicts (Pi-hole v6 uses built-in web server)
-#        🔧 Automatic port conflict resolution for lighttpd vs pihole-FTL
-#        🔧 Graceful handling of lighttpd (stop/disable/remove options)
-#        🔧 Verifies pihole-FTL service is running correctly
-#        🔧 Tests DNS resolution before continuing
-#        🔧 Provides clear error messages with step-by-step repair instructions
-#        🔧 If auto-repair fails, exits with detailed note for manual intervention
-#        🔧 Based on official Pi-hole v6 migration guidance
-# ==============================================================================
-# v1.1.5 - Added version auto-detection (works with future Pi-hole versions)
-# v1.1.4 - Added jq and curl for minimal OS installs
-# v1.1.3 - Added enterprise-grade improvements
-# v1.1.2 - Added DNS restriction option
-# v1.1.1 - Fixed syntax error
-# v1.1.0 - Added temporary self-signed certificate
-# ==============================================================================
-#
-# This script configures Pi-hole with enterprise-grade encryption:
-# 🔒 HTTPS web interface with Let's Encrypt
-# 🔒 DNS-over-HTTPS (DoH), DNS-over-TLS (DoT), DNS-over-QUIC (DoQ)
-#
-# 🛡️ v1.1.6 NEW: Validates Pi-hole and lighttpd services before setup
-#   • Ensures Pi-hole v6+ is running correctly
-#   • Detects and resolves lighttpd conflicts
-#   • Tests DNS functionality
-#   • Provides clear repair guidance
-#
-# 📡 UPnP Syntax: upnpc -a [internal_ip] [internal_port] [external_port] [protocol]
-#   Example: upnpc -a 192.168.1.100 443 443 tcp
+# v1.1.8 - MAJOR IMPROVEMENTS based on real-world experience:
+#        ✅ BACKUP-FIRST approach - backup BEFORE any changes
+#        ✅ RESTORE MENU - option to restore from backup if something fails
+#        ✅ NO FIREWALL CONFIG - removed all firewall code (users handle iptables)
+#        ✅ DOMAIN VERIFICATION - checks DNS resolution before proceeding
+#        ✅ BETTER ERROR HANDLING - auto-restore on critical failures
+#        ✅ SERVICE VALIDATION - verifies HTTPS and DNS after changes
+#        ✅ INTERACTIVE MENU - install, restore, uninstall options
+#        ✅ CONFIG VALIDATION - checks webserver.domain matches certificate
+#        ✅ ROLLBACK ON FAILURE - automatically restores if verification fails
 #
 #############################################################################################################################
 
@@ -62,58 +36,25 @@ NC='\033[0m' # No Color
 # Configuration variables
 DOMAIN=""
 EMAIL=""
-WEB_PORT=""
+WEB_PORT="443"
 DNS_TLS_PORT="853"
 INTERFACE="eth0"
 LOCAL_IP=""
-LOCAL_IP6=""
 USE_UPNP=""
-LE_EMAIL=""
-ACME_CLIENT="certbot"
-LETSENCRYPT_DIR=""
-WEBROOT="/var/www/html"
 RESTRICT_DNS="true"
 
 # Pi-hole version info
 PIHOLE_VERSION_MAJOR=0
-PIHOLE_VERSION_MINOR=0
-PIHOLE_VERSION_PATCH=0
-
-# Service status tracking
-PIHOLE_FTL_STATUS="unknown"
-LIGHTTPD_STATUS="unknown"
-LIGHTTPD_ENABLED="unknown"
-DNS_TEST_RESULT="unknown"
-
-# Network detection
-LOCAL_SUBNETS=()
-LOCAL_SUBNETS6=()
-
-# OS Detection variables
-OS_TYPE=""
-OS_VERSION=""
-OS_FAMILY=""
-PKG_MANAGER=""
-INSTALL_CMD=""
-UPDATE_CMD=""
-REMOVE_CMD=""
-FIREWALL_TYPE=""
 
 # Fixed paths
 PIHOLE_CERT="/etc/pihole/tls.pem"
 PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
-PIHOLE_OLD_CONFIG="/etc/pihole/pihole.toml.bak"
-PIHOLE_TELEPORTER="/etc/pihole/teleporter_$(date +%Y%m%d_%H%M%S).tar.gz"
-BACKUP_DIR="/root/pihole-backup-$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.1.6"
+SCRIPT_VERSION="1.1.8"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
-ACME_HOME="/root/.acme.sh"
-
-# Debug flag
-DEBUG=true
 
 # Error trap
 trap 'error_handler $? $LINENO' ERR
@@ -122,100 +63,30 @@ error_handler() {
     local exit_code=$1
     local line_no=$2
     print_error "Error on line $line_no: exit code $exit_code"
+    
+    # Ask if user wants to restore from backup
+    if [[ -d "$BACKUP_DIR" ]]; then
+        echo ""
+        print_warning "Would you like to restore from the backup taken before this step?"
+        read -p "Restore from backup? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            restore_from_backup
+        fi
+    fi
+    
     print_error "Script execution stopped. Check $LOG_FILE for details"
     exit $exit_code
 }
-
-# Required packages by OS
-declare -A DEBIAN_PKGS=(
-    ["certbot"]="certbot"
-    ["openssl"]="openssl"
-    ["curl"]="curl"
-    ["jq"]="jq"
-    ["wget"]="wget"
-    ["ufw"]="ufw"
-    ["firewalld"]="firewalld"
-    ["net-tools"]="net-tools"
-    ["dnsutils"]="dnsutils"
-    ["bind9-dnsutils"]="bind9-dnsutils"
-    ["python3"]="python3"
-    ["python3-pip"]="python3-pip"
-    ["miniupnpc"]="miniupnpc"
-    ["iproute2"]="iproute2"
-    ["nmap"]="nmap"
-    ["lsof"]="lsof"
-    ["cron"]="cron"
-    ["systemd"]="systemd"
-    ["iptables"]="iptables"
-    ["nftables"]="nftables"
-)
-
-declare -A CENTOS_PKGS=(
-    ["certbot"]="certbot"
-    ["openssl"]="openssl"
-    ["curl"]="curl"
-    ["jq"]="jq"
-    ["wget"]="wget"
-    ["ufw"]="ufw"
-    ["firewalld"]="firewalld"
-    ["net-tools"]="net-tools"
-    ["bind-utils"]="bind-utils"
-    ["python3"]="python3"
-    ["python3-pip"]="python3-pip"
-    ["miniupnpc"]="miniupnpc"
-    ["iproute"]="iproute"
-    ["nmap"]="nmap"
-    ["lsof"]="lsof"
-    ["cronie"]="cronie"
-    ["iptables"]="iptables"
-    ["nftables"]="nftables"
-)
-
-declare -A FEDORA_PKGS=(
-    ["certbot"]="certbot"
-    ["openssl"]="openssl"
-    ["curl"]="curl"
-    ["jq"]="jq"
-    ["wget"]="wget"
-    ["ufw"]="ufw"
-    ["firewalld"]="firewalld"
-    ["net-tools"]="net-tools"
-    ["bind-utils"]="bind-utils"
-    ["python3"]="python3"
-    ["python3-pip"]="python3-pip"
-    ["miniupnpc"]="miniupnpc"
-    ["iproute"]="iproute"
-    ["nmap"]="nmap"
-    ["lsof"]="lsof"
-    ["cronie"]="cronie"
-    ["iptables"]="iptables"
-    ["nftables"]="nftables"
-)
-
-# Services that need restart tracking
-declare -a SERVICES_TO_RESTART=()
-declare -a PORTS_TO_CHECK=()
-
-# Step tracking
-CURRENT_STEP=0
-TOTAL_STEPS=32  # Increased for enhanced recovery steps
 
 #================================================================================
 # UTILITY FUNCTIONS
 #================================================================================
 
-debug_log() {
-    if [[ "$DEBUG" == true ]]; then
-        echo -e "${PURPLE}[DEBUG]${NC} $1" | tee -a "$LOG_FILE"
-    fi
-}
-
 print_step() {
-    CURRENT_STEP=$((CURRENT_STEP + 1))
     echo -e "\n${PURPLE}═══════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}STEP $CURRENT_STEP OF $TOTAL_STEPS: $1${NC}"
+    echo -e "${CYAN}STEP: $1${NC}"
     echo -e "${PURPLE}═══════════════════════════════════════════════════════════════════════════════${NC}"
-    debug_log "Starting step $CURRENT_STEP: $1"
     sleep 1
 }
 
@@ -235,1823 +106,501 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"
 }
 
-pause() {
-    echo ""
-    read -p "Press Enter to continue..." -r
-    echo ""
+#================================================================================
+# BACKUP FUNCTIONS (NOW RUNS FIRST!)
+#================================================================================
+
+create_backup() {
+    print_step "Creating Comprehensive Backup (BEFORE any changes)"
+    print_message "Backup location: $BACKUP_DIR"
+    
+    mkdir -p "$BACKUP_DIR"
+    
+    # Backup Pi-hole configuration
+    if [[ -f "$PIHOLE_CONFIG" ]]; then
+        cp "$PIHOLE_CONFIG" "$BACKUP_DIR/pihole.toml.backup"
+        print_message "✓ Backed up Pi-hole config"
+    fi
+    
+    # Backup certificates
+    if [[ -f "$PIHOLE_CERT" ]]; then
+        cp "$PIHOLE_CERT" "$BACKUP_DIR/tls.pem.backup"
+        print_message "✓ Backed up TLS certificate"
+    fi
+    
+    if [[ -f "$PIHOLE_CA_CERT" ]]; then
+        cp "$PIHOLE_CA_CERT" "$BACKUP_DIR/tls_ca.crt.backup"
+        print_message "✓ Backed up CA certificate"
+    fi
+    
+    # Backup Let's Encrypt if exists
+    if [[ -d "/etc/letsencrypt" ]]; then
+        cp -r "/etc/letsencrypt" "$BACKUP_DIR/letsencrypt.backup" 2>/dev/null || true
+        print_message "✓ Backed up Let's Encrypt"
+    fi
+    
+    # Backup custom settings
+    pihole-FTL --config-all > "$BACKUP_DIR/ftl-config.txt" 2>/dev/null || true
+    
+    # Create state backup
+    if [[ -f "$INSTALL_STATE_FILE" ]]; then
+        cp "$INSTALL_STATE_FILE" "$BACKUP_DIR/installation.state.backup"
+    fi
+    
+    # Create restore script
+    cat > "$BACKUP_DIR/restore.sh" << 'EOF'
+#!/bin/bash
+echo "Restoring Pi-hole from backup..."
+echo "Backup directory: $(pwd)"
+
+# Restore config
+if [[ -f "pihole.toml.backup" ]]; then
+    cp pihole.toml.backup /etc/pihole/pihole.toml
+    echo "✓ Restored Pi-hole config"
+fi
+
+# Restore certificates
+if [[ -f "tls.pem.backup" ]]; then
+    cp tls.pem.backup /etc/pihole/tls.pem
+    chown pihole:pihole /etc/pihole/tls.pem 2>/dev/null
+    chmod 600 /etc/pihole/tls.pem
+    echo "✓ Restored TLS certificate"
+fi
+
+if [[ -f "tls_ca.crt.backup" ]]; then
+    cp tls_ca.crt.backup /etc/pihole/tls_ca.crt
+    chown pihole:pihole /etc/pihole/tls_ca.crt 2>/dev/null
+    chmod 644 /etc/pihole/tls_ca.crt
+    echo "✓ Restored CA certificate"
+fi
+
+# Restart Pi-hole
+systemctl restart pihole-FTL
+sleep 5
+
+echo "Restore complete! Testing..."
+curl -k https://localhost:443/admin/ -I
+EOF
+    
+    chmod +x "$BACKUP_DIR/restore.sh"
+    
+    print_success "✓ Backup completed successfully"
+    print_message "To restore manually later: sudo $BACKUP_DIR/restore.sh"
+    pause
 }
 
-check_command() {
-    local cmd=$1
-    local pkg=$2
-    if ! command -v "$cmd" &> /dev/null; then
-        print_warning "$cmd not found. Please install $pkg package."
+restore_from_backup() {
+    print_step "Restoring from Backup"
+    
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        print_error "Backup directory not found: $BACKUP_DIR"
         return 1
     fi
-    return 0
-}
-
-#================================================================================
-# ENHANCED SERVICE RECOVERY (NEW in v1.1.6)
-#================================================================================
-
-attempt_service_recovery() {
-    print_step "Attempting Enhanced Service Recovery"
-    debug_log "Entering attempt_service_recovery"
-
-    local max_attempts=3
-    local attempt=1
-    local recovered=false
-
-    while [[ $attempt -le $max_attempts ]] && [[ "$recovered" == false ]]; do
-        print_message "Recovery attempt $attempt of $max_attempts..."
-
-        # Step 1: Generate fresh self-signed certificate for Pi-hole
-        print_message "Generating fresh self-signed certificate..."
-        rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
-        systemctl restart pihole-FTL
-        sleep 5
-
-        # Step 2: Handle lighttpd if it's causing issues
-        if systemctl is-active --quiet lighttpd 2>/dev/null; then
-            print_message "Stopping lighttpd (conflicts with Pi-hole v6)..."
-            systemctl stop lighttpd
-            systemctl disable lighttpd
-        fi
-
-        # Step 3: Restart both services in correct order
-        print_message "Restarting services in correct order..."
-        systemctl restart pihole-FTL
-        sleep 3
-
-        # Step 4: Wait 10 seconds for services to stabilize
-        print_message "Waiting 10 seconds for services to stabilize..."
-        sleep 10
-
-        # Step 5: Test if services are now working
-        print_message "Testing service health..."
-        local service_ok=true
-
-        # Test pihole-FTL
-        if ! systemctl is-active --quiet pihole-FTL; then
-            service_ok=false
-            print_warning "pihole-FTL still not running"
-        else
-            print_success "✓ pihole-FTL is running"
-        fi
-
-        # Test lighttpd (should be stopped)
-        if systemctl is-active --quiet lighttpd 2>/dev/null; then
-            service_ok=false
-            print_warning "lighttpd is STILL running"
-        else
-            print_success "✓ lighttpd is stopped (good)"
-        fi
-
-        # Test DNS resolution
-        if command -v dig &> /dev/null; then
-            if dig +short google.com @127.0.0.1 2>/dev/null | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
-                print_success "✓ DNS resolution working"
-            else
-                service_ok=false
-                print_warning "DNS resolution still failing"
-            fi
-        fi
-
-        if [[ "$service_ok" == true ]]; then
-            recovered=true
-            print_success "✅ Services recovered successfully on attempt $attempt"
-        else
-            print_warning "Recovery attempt $attempt failed"
-            if [[ $attempt -lt $max_attempts ]]; then
-                print_message "Will retry in 5 seconds..."
-                sleep 5
-            fi
-        fi
-
-        ((attempt++))
-    done
-
-    if [[ "$recovered" == false ]]; then
-        print_error "❌ Could not recover services after $max_attempts attempts"
-        print_message "Please check the following:"
-        echo "  1. Run 'systemctl status pihole-FTL' to see errors"
-        echo "  2. Check logs: 'journalctl -u pihole-FTL -f'"
-        echo "  3. Verify no other services are using port 53 or 80"
-        echo "  4. Consider reinstalling Pi-hole if issues persist"
-        exit 1
+    
+    if [[ -f "$BACKUP_DIR/restore.sh" ]]; then
+        bash "$BACKUP_DIR/restore.sh"
+        print_success "Restore completed"
+    else
+        print_error "Restore script not found in backup"
+        return 1
     fi
-
+    
     pause
 }
 
 #================================================================================
-# PI-HOLE SERVICE VALIDATION
-#================================================================================
-
-validate_pihole_services() {
-    print_step "Validating Pi-hole Services"
-    debug_log "Entering validate_pihole_services"
-
-    local repair_needed=false
-    local errors=()
-
-    echo -e "${CYAN}Checking Pi-hole FTL service...${NC}"
-
-    # Check if pihole-FTL service exists
-    if ! systemctl list-unit-files | grep -q "pihole-FTL"; then
-        print_error "Pi-hole FTL service not found! Pi-hole may not be properly installed."
-        errors+=("pihole-FTL service missing")
-        repair_needed=true
-    else
-        # Check if service is running
-        if systemctl is-active --quiet pihole-FTL; then
-            PIHOLE_FTL_STATUS="running"
-            print_success "✓ pihole-FTL is running"
-        else
-            PIHOLE_FTL_STATUS="stopped"
-            print_warning "⚠ pihole-FTL is not running"
-            errors+=("pihole-FTL not running")
-            repair_needed=true
-        fi
-
-        # Check if service is enabled
-        if systemctl is-enabled --quiet pihole-FTL 2>/dev/null; then
-            print_success "✓ pihole-FTL is enabled"
-        else
-            print_warning "⚠ pihole-FTL is not enabled to start at boot"
-            errors+=("pihole-FTL not enabled")
-            repair_needed=true
-        fi
-    fi
-
-    echo ""
-    echo -e "${CYAN}Checking lighttpd service (Pi-hole v6+ uses built-in web server)...${NC}"
-
-    # Check if lighttpd is installed
-    if command -v lighttpd &> /dev/null || systemctl list-unit-files | grep -q "lighttpd"; then
-        LIGHTTPD_STATUS="installed"
-        print_warning "⚠ lighttpd is installed"
-
-        # Check if lighttpd is running
-        if systemctl is-active --quiet lighttpd 2>/dev/null; then
-            LIGHTTPD_STATUS="running"
-            print_warning "⚠ lighttpd is RUNNING - this will conflict with Pi-hole v6 built-in web server "
-            errors+=("lighttpd running (conflict with pihole-FTL)")
-            repair_needed=true
-        else
-            print_message "lighttpd is installed but not running"
-        fi
-
-        # Check if lighttpd is enabled
-        if systemctl is-enabled --quiet lighttpd 2>/dev/null; then
-            LIGHTTPD_ENABLED="enabled"
-            print_warning "⚠ lighttpd is ENABLED to start at boot"
-            errors+=("lighttpd enabled")
-            repair_needed=true
-        else
-            print_message "lighttpd is not enabled"
-        fi
-    else
-        LIGHTTPD_STATUS="not_installed"
-        print_success "✓ lighttpd not installed (good - Pi-hole v6 uses built-in web server)"
-    fi
-
-    echo ""
-    echo -e "${CYAN}Testing DNS resolution...${NC}"
-
-    # Test DNS resolution through local Pi-hole
-    if command -v dig &> /dev/null; then
-        if dig +short google.com @127.0.0.1 2>/dev/null | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
-            DNS_TEST_RESULT="working"
-            print_success "✓ DNS resolution working through local Pi-hole"
-        else
-            DNS_TEST_RESULT="failed"
-            print_warning "⚠ DNS resolution test failed - Pi-hole may not be resolving queries"
-            errors+=("DNS resolution failed")
-            repair_needed=true
-        fi
-    elif command -v nslookup &> /dev/null; then
-        if nslookup google.com 127.0.0.1 2>/dev/null | grep -q "Address"; then
-            DNS_TEST_RESULT="working"
-            print_success "✓ DNS resolution working through local Pi-hole"
-        else
-            DNS_TEST_RESULT="failed"
-            print_warning "⚠ DNS resolution test failed - Pi-hole may not be resolving queries"
-            errors+=("DNS resolution failed")
-            repair_needed=true
-        fi
-    else
-        print_warning "DNS testing tools not available - skipping resolution test"
-    fi
-
-    echo ""
-
-    # If repairs are needed, attempt enhanced recovery
-    if [[ "$repair_needed" == true ]]; then
-        print_warning "Issues detected with Pi-hole services. Attempting enhanced recovery..."
-
-        # First try the enhanced recovery process
-        attempt_service_recovery
-
-        # After recovery, re-validate
-        print_message "Re-validating services after recovery..."
-
-        if systemctl is-active --quiet pihole-FTL; then
-            print_success "✓ pihole-FTL is now running"
-        else
-            print_error "pihole-FTL still not running after recovery"
-            exit 1
-        fi
-
-        if systemctl is-active --quiet lighttpd 2>/dev/null; then
-            print_error "lighttpd is STILL running after recovery"
-            exit 1
-        fi
-
-        if command -v dig &> /dev/null; then
-            if dig +short google.com @127.0.0.1 2>/dev/null | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
-                print_success "✓ DNS resolution now working"
-            else
-                print_error "DNS resolution still failing after recovery"
-                exit 1
-            fi
-        fi
-
-        print_success "✅ Services successfully recovered!"
-    else
-        print_success "All Pi-hole services validated successfully"
-    fi
-
-    pause
-}
-
-#================================================================================
-# ROOT CHECK FUNCTIONS
+# ROOT CHECK
 #================================================================================
 
 check_root() {
     print_step "Checking Root Privileges"
-    debug_log "Entering check_root"
-
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
-        print_message "Please run: sudo $0"
         exit 1
     fi
-
     print_success "Root privileges confirmed"
-    debug_log "Root check passed"
     pause
 }
 
 #================================================================================
-# OS DETECTION FUNCTIONS
+# DOMAIN VERIFICATION (NEW)
 #================================================================================
 
-detect_os() {
-    print_step "Detecting Operating System"
-    debug_log "Entering detect_os"
-
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS_TYPE="$ID"
-        OS_VERSION="$VERSION_ID"
-    elif [[ -f /etc/debian_version ]]; then
-        OS_TYPE="debian"
-        OS_VERSION=$(cat /etc/debian_version)
-    elif [[ -f /etc/redhat-release ]]; then
-        OS_TYPE="rhel"
-        OS_VERSION=$(rpm -q --qf "%{VERSION}" $(rpm -q --whatprovides redhat-release))
-    else
-        OS_TYPE="unknown"
-    fi
-
-    case $OS_TYPE in
-        ubuntu|debian|raspbian|linuxmint|pop|elementary|zorin)
-            OS_FAMILY="debian"
-            PKG_MANAGER="apt-get"
-            INSTALL_CMD="apt-get install -y"
-            UPDATE_CMD="apt-get update"
-            REMOVE_CMD="apt-get remove -y"
-            ;;
-        centos|rhel|rocky|almalinux)
-            OS_FAMILY="rhel"
-            PKG_MANAGER="yum"
-            INSTALL_CMD="yum install -y"
-            UPDATE_CMD="yum check-update"
-            REMOVE_CMD="yum remove -y"
-            ;;
-        fedora)
-            OS_FAMILY="fedora"
-            PKG_MANAGER="dnf"
-            INSTALL_CMD="dnf install -y"
-            UPDATE_CMD="dnf check-update"
-            REMOVE_CMD="dnf remove -y"
-            ;;
-        *)
-            OS_FAMILY="unknown"
-            ;;
-    esac
-
-    print_message "Detected OS: $OS_TYPE $OS_VERSION"
-    print_message "OS Family: $OS_FAMILY"
-    print_message "Package Manager: $PKG_MANAGER"
-    print_success "OS detection successful"
-    debug_log "OS detection complete: $OS_FAMILY"
-    pause
-}
-
-#================================================================================
-# DEPENDENCY INSTALLATION FUNCTIONS
-#================================================================================
-
-install_dependencies() {
-    print_step "Installing Dependencies"
-    debug_log "Entering install_dependencies"
-
-    if [[ "$OS_FAMILY" == "unknown" ]]; then
-        print_warning "Unknown OS - please install dependencies manually"
-        print_message "Required packages: certbot, openssl, curl, jq, wget, dnsutils, python3, miniupnpc, iproute2"
-        return
-    fi
-
-    print_message "Updating package lists..."
-    $UPDATE_CMD >> "$LOG_FILE" 2>&1 || true
-
-    print_message "Installing required packages (this may take a few minutes)..."
-
-    case $OS_FAMILY in
-        debian)
-            for pkg in "${!DEBIAN_PKGS[@]}"; do
-                if ! dpkg -l | grep -q "^ii  $pkg "; then
-                    print_message "Installing $pkg..."
-                    $INSTALL_CMD "${DEBIAN_PKGS[$pkg]}" >> "$LOG_FILE" 2>&1
-                fi
-            done
-            ;;
-        rhel|fedora)
-            if [[ "$OS_FAMILY" == "rhel" ]] && ! rpm -q epel-release &>/dev/null; then
-                print_message "Installing EPEL repository..."
-                $INSTALL_CMD epel-release >> "$LOG_FILE" 2>&1
-            fi
-
-            if [[ "$OS_FAMILY" == "rhel" ]]; then
-                for pkg in "${!CENTOS_PKGS[@]}"; do
-                    if ! rpm -q "${CENTOS_PKGS[$pkg]}" &>/dev/null; then
-                        print_message "Installing $pkg..."
-                        $INSTALL_CMD "${CENTOS_PKGS[$pkg]}" >> "$LOG_FILE" 2>&1
-                    fi
-                done
-            else
-                for pkg in "${!FEDORA_PKGS[@]}"; do
-                    if ! rpm -q "${FEDORA_PKGS[$pkg]}" &>/dev/null; then
-                        print_message "Installing $pkg..."
-                        $INSTALL_CMD "${FEDORA_PKGS[$pkg]}" >> "$LOG_FILE" 2>&1
-                    fi
-                done
-            fi
-            ;;
-    esac
-
-    # Install Python packages for validation
-    print_message "Installing Python validation tools..."
-    pip3 install h2 quic aioquic dnspython >> "$LOG_FILE" 2>&1 || true
-
-    # Verify critical tools are installed
-    print_message "Verifying critical tools..."
-
-    local missing_tools=()
-    check_command "curl" "curl" || missing_tools+=("curl")
-    check_command "jq" "jq" || missing_tools+=("jq")
-    check_command "dig" "dnsutils/bind-utils" || print_warning "dig not found - some DNS tests may be limited"
-    check_command "openssl" "openssl" || missing_tools+=("openssl")
-    check_command "certbot" "certbot" || missing_tools+=("certbot")
-
-    if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        print_warning "Missing tools: ${missing_tools[*]}"
-        print_message "Some features may be limited. Continuing anyway..."
-    else
-        print_success "All critical tools verified"
-    fi
-
-    # Verify UPnP is installed
-    if command -v upnpc &> /dev/null; then
-        print_success "UPnP client (miniupnpc) installed"
-        print_message "UPnP syntax: upnpc -a [internal_ip] [internal_port] [external_port] [protocol]"
-    else
-        print_warning "UPnP client not available. Port forwarding will be manual."
-    fi
-
-    print_success "Dependency installation completed"
-    debug_log "Dependencies installation complete"
-    pause
-}
-
-#================================================================================
-# FIREWALL DETECTION
-#================================================================================
-
-detect_firewall() {
-    print_step "Detecting Firewall System"
-    debug_log "Entering detect_firewall"
-
-    FIREWALL_TYPE="none"
-
-    if command -v ufw &> /dev/null && systemctl is-active --quiet ufw 2>/dev/null; then
-        FIREWALL_TYPE="ufw"
-        print_success "Detected UFW firewall"
-    elif command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        FIREWALL_TYPE="firewalld"
-        print_success "Detected firewalld"
-    elif command -v nft &> /dev/null && systemctl is-active --quiet nftables 2>/dev/null; then
-        FIREWALL_TYPE="nftables"
-        print_success "Detected nftables"
-    elif command -v iptables &> /dev/null; then
-        FIREWALL_TYPE="iptables"
-        print_success "Detected iptables"
-    else
-        print_warning "No active firewall detected"
-    fi
-
-    debug_log "Firewall type: $FIREWALL_TYPE"
-    pause
-}
-
-#================================================================================
-# NETWORK DETECTION FUNCTIONS
-#================================================================================
-
-detect_local_subnets() {
-    print_step "Detecting Local Network Subnets (Accurate CIDR)"
-    debug_log "Entering detect_local_subnets"
-
-    LOCAL_SUBNETS=()
-    LOCAL_SUBNETS6=()
-
-    # Get exact IPv4 CIDR from OS
+verify_domain_resolution() {
+    print_step "Verifying Domain Resolution"
+    
+    local domain_ip=""
+    local local_ip=""
+    
+    # Get local IP
     if command -v ip &> /dev/null; then
-        while read -r cidr; do
-            if [[ -n "$cidr" ]]; then
-                LOCAL_SUBNETS+=("$cidr")
-                print_message "Detected IPv4 subnet: $cidr"
-            fi
-        done < <(ip -o -f inet addr show | awk '/scope global/ {print $4}')
-
-        # Get IPv6 subnets
-        if ip -o -f inet6 addr show | grep -q "scope global"; then
-            while read -r cidr6; do
-                if [[ -n "$cidr6" ]]; then
-                    LOCAL_SUBNETS6+=("$cidr6")
-                    print_message "Detected IPv6 subnet: $cidr6"
-                fi
-            done < <(ip -o -f inet6 addr show | awk '/scope global/ {print $4}')
-        fi
+        local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
     fi
-
-    # Add common local networks as fallback (if not already present)
-    local common_nets=("192.168.0.0/16" "10.0.0.0/8" "172.16.0.0/12")
-    for net in "${common_nets[@]}"; do
-        if [[ ! " ${LOCAL_SUBNETS[@]} " =~ " ${net} " ]]; then
-            LOCAL_SUBNETS+=("$net")
-        fi
-    done
-
-    # Remove duplicates
-    LOCAL_SUBNETS=($(echo "${LOCAL_SUBNETS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
-
-    print_success "Local subnets detected: ${LOCAL_SUBNETS[*]}"
-    if [[ ${#LOCAL_SUBNETS6[@]} -gt 0 ]]; then
-        print_success "IPv6 subnets detected: ${LOCAL_SUBNETS6[*]}"
+    
+    if [[ -z "$local_ip" ]]; then
+        local_ip=$(hostname -I | awk '{print $1}')
     fi
-    debug_log "IPv4 subnets: ${LOCAL_SUBNETS[*]}"
-    debug_log "IPv6 subnets: ${LOCAL_SUBNETS6[*]}"
-    pause
-}
-
-#================================================================================
-# PI-HOLE VERSION CHECK
-#================================================================================
-
-check_pihole_version() {
-    print_step "Checking Pi-hole Version"
-    debug_log "Entering check_pihole_version"
-
-    if ! command -v pihole &> /dev/null; then
-        print_error "Pi-hole is not installed"
-        exit 1
+    
+    print_message "Your local IP: $local_ip"
+    
+    # Try to resolve the domain
+    if command -v dig &> /dev/null; then
+        domain_ip=$(dig +short "$DOMAIN" @8.8.8.8 2>/dev/null | head -1)
+    elif command -v nslookup &> /dev/null; then
+        domain_ip=$(nslookup "$DOMAIN" 8.8.8.8 2>/dev/null | grep -A 1 "Name:" | grep "Address:" | awk '{print $2}' | head -1)
     fi
-
-    # Get version string
-    local version_output
-    version_output=$(pihole-FTL --version 2>&1 | head -n1)
-    print_message "Detected: $version_output"
-
-    # Parse version number (supports v6.5, v7.0, v8.1.2, etc.)
-    if [[ $version_output =~ v([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
-        PIHOLE_VERSION_MAJOR="${BASH_REMATCH[1]}"
-        PIHOLE_VERSION_MINOR="${BASH_REMATCH[2]}"
-        PIHOLE_VERSION_PATCH="${BASH_REMATCH[4]:-0}"
-
-        print_message "Parsed version: $PIHOLE_VERSION_MAJOR.$PIHOLE_VERSION_MINOR.$PIHOLE_VERSION_PATCH"
-
-        # Check if major version is at least 6 (future-proof)
-        if [[ $PIHOLE_VERSION_MAJOR -ge 6 ]]; then
-            print_success "Pi-hole v$PIHOLE_VERSION_MAJOR detected - compatible with this script"
-
-            # Warn if version is newer than tested
-            if [[ $PIHOLE_VERSION_MAJOR -gt 6 ]]; then
-                print_warning "Pi-hole v$PIHOLE_VERSION_MAJOR is newer than the version this script was tested with (v6)"
-                print_warning "The script should work, but some features may have changed."
-                read -p "Continue anyway? (Y/n): " -n 1 -r
-                echo
-                if [[ $REPLY =~ ^[Nn]$ ]]; then
-                    exit 0
-                fi
-            fi
+    
+    if [[ -n "$domain_ip" ]]; then
+        print_message "Domain $DOMAIN resolves to: $domain_ip"
+        
+        if [[ "$domain_ip" == "$local_ip" ]]; then
+            print_success "✓ Domain resolves to this server's IP (good)"
         else
-            print_error "Pi-hole v$PIHOLE_VERSION_MAJOR is not supported (need v6 or higher)"
+            print_warning "⚠ Domain resolves to $domain_ip but this server is $local_ip"
+            print_warning "Make sure your domain's A record points to your PUBLIC IP, not local IP"
             echo ""
-            echo "Please upgrade to Pi-hole v6 or later first:"
-            echo "  pihole -up"
-            exit 1
-        fi
-    else
-        # Fallback: just check for v6 in string
-        if echo "$version_output" | grep -q "v6"; then
-            print_success "Pi-hole v6 detected (using fallback detection)"
-            PIHOLE_VERSION_MAJOR=6
-        else
-            print_warning "Could not parse Pi-hole version. Assuming v6+ and continuing..."
-            print_warning "If you encounter issues, please upgrade to Pi-hole v6."
-            PIHOLE_VERSION_MAJOR=6
-        fi
-    fi
-
-    debug_log "Pi-hole major version: $PIHOLE_VERSION_MAJOR"
-    pause
-}
-
-#================================================================================
-# PI-HOLE TELEPORTER BACKUP
-#================================================================================
-
-create_teleporter_backup() {
-    print_step "Creating Pi-hole Teleporter Backup"
-    debug_log "Entering create_teleporter_backup"
-
-    if command -v pihole &> /dev/null; then
-        print_message "Exporting complete Pi-hole configuration..."
-
-        # Use pihole -a -t to create teleporter backup
-        if pihole -a -t "$PIHOLE_TELEPORTER" >> "$LOG_FILE" 2>&1; then
-            print_success "Teleporter backup created: $PIHOLE_TELEPORTER"
-
-            # Also copy to backup directory
-            cp "$PIHOLE_TELEPORTER" "$BACKUP_DIR/" 2>/dev/null || true
-        else
-            print_warning "Teleporter backup failed, continuing anyway..."
-        fi
-    else
-        print_warning "Pi-hole command not found, skipping teleporter backup"
-    fi
-
-    pause
-}
-
-#================================================================================
-# DOH HEALTH CHECK
-#================================================================================
-
-test_doh_endpoint() {
-    print_step "Testing DoH Endpoint Health"
-    debug_log "Entering test_doh_endpoint"
-
-    local test_domain="google.com"
-    local max_attempts=6
-    local attempt=1
-    local doh_ok=false
-
-    print_message "Testing DoH resolution for $test_domain via https://$DOMAIN:$WEB_PORT/dns-query"
-
-    while [[ $attempt -le $max_attempts ]] && [[ "$doh_ok" == false ]]; do
-        sleep 5
-        print_message "Attempt $attempt/$max_attempts..."
-
-        # Method 1: Use dig with DoH if available (best method)
-        if command -v dig &> /dev/null; then
-            if dig +short @localhost -p "$WEB_PORT" "$test_domain" +https 2>/dev/null | grep -q '^[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+$'; then
-                doh_ok=true
-                print_success "Method 1 (dig+DoH) succeeded"
-                break
+            read -p "Continue anyway? (y/n): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 0
             fi
         fi
-
-        # Method 2: Use curl with JSON API and jq if available
-        if command -v curl &> /dev/null && command -v jq &> /dev/null; then
-            local response
-            response=$(curl -sk -H "accept: application/dns-json" "https://localhost:$WEB_PORT/dns-query?name=$test_domain&type=A" 2>/dev/null)
-            if echo "$response" | jq -e '.Answer' &>/dev/null; then
-                doh_ok=true
-                print_success "Method 2 (curl+jq) succeeded"
-                break
-            fi
-        fi
-
-        # Method 3: Simple curl check (just see if endpoint responds)
-        if curl -sk -o /dev/null -w "%{http_code}" "https://localhost:$WEB_PORT/dns-query" 2>/dev/null | grep -q "200\|400\|405"; then
-            print_message "DoH endpoint is responding (HTTP $(curl -sk -o /dev/null -w "%{http_code}" "https://localhost:$WEB_PORT/dns-query" 2>/dev/null))"
-            if [[ $attempt -ge 3 ]]; then
-                # After a few attempts, consider it working if we get any response
-                doh_ok=true
-                print_success "Method 3 (basic response) succeeded"
-                break
-            fi
-        fi
-
-        ((attempt++))
-    done
-
-    if [[ "$doh_ok" == true ]]; then
-        print_success "✅ DoH endpoint is working correctly - resolved $test_domain"
     else
-        print_warning "⚠️ DoH endpoint test failed - manual verification recommended"
-        print_message "You can test manually with:"
-        echo "  curl -skH 'accept: application/dns-json' 'https://$DOMAIN:$WEB_PORT/dns-query?name=google.com&type=A'"
+        print_warning "⚠ Could not resolve $DOMAIN"
+        print_warning "Make sure your domain has an A record pointing to your public IP"
         echo ""
-        echo "Or with dig (if installed):"
-        echo "  dig +short @localhost -p $WEB_PORT google.com +https"
+        read -p "Continue anyway? (y/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 0
+        fi
     fi
-
+    
     pause
 }
 
 #================================================================================
-# PORT FUNCTIONS WITH WHILE LOOP
+# SERVICE VALIDATION (NEW)
 #================================================================================
 
-check_port() {
-    local port=$1
-    local proto=$2
-    local in_use=false
-    local using_pihole=false
-
-    debug_log "Checking port $port/$proto"
-
-    if [[ "$proto" == "tcp" ]]; then
-        if command -v ss &> /dev/null; then
-            if ss -tlnp 2>/dev/null | grep -q ":$port "; then
-                in_use=true
-                # Check if pihole-FTL is using this port
-                if ss -tlnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
-                    using_pihole=true
-                fi
-            fi
-        elif command -v netstat &> /dev/null; then
-            if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
-                in_use=true
-                if netstat -tlnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
-                    using_pihole=true
-                fi
-            fi
-        fi
-    elif [[ "$proto" == "udp" ]]; then
-        if command -v ss &> /dev/null; then
-            if ss -ulnp 2>/dev/null | grep -q ":$port "; then
-                in_use=true
-                if ss -ulnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
-                    using_pihole=true
-                fi
-            fi
-        elif command -v netstat &> /dev/null; then
-            if netstat -ulnp 2>/dev/null | grep -q ":$port "; then
-                in_use=true
-                if netstat -ulnp 2>/dev/null | grep ":$port " | grep -q "pihole-FTL"; then
-                    using_pihole=true
-                fi
-            fi
-        fi
-    fi
-
-    if [[ "$in_use" == true ]]; then
-        if [[ "$using_pihole" == true ]]; then
-            debug_log "Port $port is used by Pi-hole (acceptable)"
-            return 2  # Used by Pi-hole (acceptable)
-        else
-            debug_log "Port $port is in use by another service"
-            return 0  # Used by other service (conflict)
-        fi
-    else
-        debug_log "Port $port is free"
-        return 1  # Free
-    fi
-}
-
-get_port_process() {
-    local port=$1
-    local proto=$2
-
-    if command -v lsof &> /dev/null; then
-        lsof -i "${proto}:${port}" 2>/dev/null | grep LISTEN
-    elif command -v ss &> /dev/null; then
-        ss -lpn 2>/dev/null | grep ":$port"
-    elif command -v netstat &> /dev/null; then
-        netstat -lnp 2>/dev/null | grep ":$port"
-    fi
-}
-
-choose_ports() {
-    print_step "Port Configuration"
-    debug_log "Entering choose_ports"
-
-    echo -e "${YELLOW}Web Interface / DoH Port Selection:${NC}"
-    echo "Options:"
-    echo "  443 - Standard HTTPS port (recommended)"
-    echo "  Custom - e.g., 4433, 8443, etc."
-    echo ""
-
-    while true; do
-        read -p "Enter web port [443]: " WEB_PORT
-        WEB_PORT=${WEB_PORT:-443}
-        WEB_PORT=$(echo "$WEB_PORT" | xargs)
-
-        if [[ ! "$WEB_PORT" =~ ^[0-9]+$ ]] || [[ "$WEB_PORT" -lt 1 ]] || [[ "$WEB_PORT" -gt 65535 ]]; then
-            print_error "Invalid port number"
-            continue
-        fi
-
-        check_port "$WEB_PORT" "tcp"
-        local result=$?
-
-        if [[ $result -eq 0 ]]; then
-            print_warning "Port $WEB_PORT is in use by another service"
-            get_port_process "$WEB_PORT" "tcp"
-            echo ""
-            read -p "Try another port? (y/n): " try_again
-            if [[ "$try_again" =~ ^[Yy]$ ]]; then
-                continue
-            fi
-        elif [[ $result -eq 2 ]]; then
-            print_message "Port $WEB_PORT is used by Pi-hole - OK"
-        fi
-
-        break
-    done
-
-    print_success "Web port set to: $WEB_PORT"
-    debug_log "Selected port: $WEB_PORT"
-    pause
-}
-
-test_ports() {
-    print_step "Testing Required Ports"
-    debug_log "Entering test_ports"
-
-    local ports_ok=false
-    local conflict_found=false
-    local retry_count=0
-    local max_retries=5
-
-    PORTS_TO_CHECK=(
-        "80:tcp:Let's Encrypt HTTP challenge (webroot)"
-        "443:tcp:Let's Encrypt HTTPS (optional)"
-        "${WEB_PORT}:tcp:HTTPS Web Interface + DoH"
-        "${DNS_TLS_PORT}:tcp:DNS-over-TLS"
-        "${DNS_TLS_PORT}:udp:DNS-over-QUIC"
-        "53:tcp:DNS (unencrypted - will be restricted)"
-        "53:udp:DNS (unencrypted - will be restricted)"
-    )
-
-    while [[ "$ports_ok" == false ]] && [[ $retry_count -lt $max_retries ]]; do
-        conflict_found=false
-
-        echo -e "${CYAN}Port Status Check (Attempt $((retry_count+1))/$max_retries):${NC}"
-        echo "───────────────────────────────────────────────────────"
-
-        for port_info in "${PORTS_TO_CHECK[@]}"; do
-            IFS=':' read -r port proto description <<< "$port_info"
-
-            check_port "$port" "$proto"
-            local result=$?
-
-            if [[ $result -eq 0 ]]; then
-                PROCESS_INFO=$(get_port_process "$port" "$proto" | head -n1)
-                echo -e "  ${RED}✗${NC} Port $port/$proto - $description"
-                echo -e "    ${YELLOW}→ In use by:${NC} $PROCESS_INFO"
-                conflict_found=true
-
-                if [[ "$port" == "80" ]] || [[ "$port" == "443" ]]; then
-                    print_warning "Port $port is used by another service, but Let's Encrypt can use webroot method"
-                fi
-            elif [[ $result -eq 2 ]]; then
-                echo -e "  ${GREEN}✓${NC} Port $port/$proto - $description ${GREEN}(used by Pi-hole - OK)${NC}"
-            else
-                echo -e "  ${GREEN}✓${NC} Port $port/$proto - $description ${GREEN}(available)${NC}"
-            fi
-        done
-
-        echo "───────────────────────────────────────────────────────"
-
-        if [[ "$conflict_found" == false ]]; then
-            ports_ok=true
-            print_success "All ports are available"
+validate_https() {
+    print_step "Validating HTTPS Service"
+    
+    local max_attempts=12
+    local attempt=1
+    local success=false
+    
+    print_message "Testing HTTPS on port $WEB_PORT..."
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        if curl -k -s -o /dev/null -w "%{http_code}" "https://localhost:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
+            success=true
             break
         fi
-
-        # Check if conflicts are only on ports 80/443 (which we can work around)
-        local has_other_conflicts=false
-        for port_info in "${PORTS_TO_CHECK[@]}"; do
-            IFS=':' read -r port proto description <<< "$port_info"
-            if [[ "$port" != "80" ]] && [[ "$port" != "443" ]]; then
-                check_port "$port" "$proto"
-                if [[ $? -eq 0 ]]; then
-                    has_other_conflicts=true
-                    break
-                fi
-            fi
-        done
-
-        if [[ "$has_other_conflicts" == true ]]; then
-            print_warning "Port conflicts detected on non-webroot ports."
-            echo ""
-            echo "Options:"
-            echo "  1) Attempt to stop conflicting services automatically"
-            echo "  2) Choose a different web port"
-            echo "  3) Exit and fix manually"
-            read -p "Choose option (1-3): " port_choice
-
-            case $port_choice in
-                1)
-                    stop_conflicting_services
-                    retry_count=$((retry_count + 1))
-                    ;;
-                2)
-                    choose_ports
-                    retry_count=0  # Reset retry count with new port
-                    ;;
-                3)
-                    print_error "Installation aborted by user due to port conflicts."
-                    exit 1
-                    ;;
-                *)
-                    print_error "Invalid choice"
-                    ;;
-            esac
-        else
-            print_message "Ports 80/443 are in use but Let's Encrypt will use webroot method - continuing"
-            ports_ok=true
-        fi
+        sleep 2
+        ((attempt++))
     done
-
-    if [[ "$ports_ok" == false ]]; then
-        print_error "Could not resolve port conflicts after $max_retries attempts"
-        exit 1
-    fi
-
-    debug_log "Port testing completed successfully"
-    pause
-}
-
-stop_conflicting_services() {
-    print_step "Stopping Conflicting Services"
-    debug_log "Entering stop_conflicting_services"
-
-    local stopped=false
-
-    for service in nginx apache2 lighttpd httpd; do
-        if systemctl is-active --quiet "$service" 2>/dev/null; then
-            # Check if it's using any of our ports (excluding 80/443 for webroot)
-            if command -v ss &> /dev/null; then
-                if ss -tlnp 2>/dev/null | grep -E ":$WEB_PORT " | grep -q "$service"; then
-                    print_message "Stopping $service..."
-                    systemctl stop "$service"
-                    systemctl disable "$service" 2>/dev/null || true
-                    stopped=true
-                fi
-            fi
-        fi
-    done
-
-    if [[ "$stopped" == true ]]; then
-        print_success "Conflicting services stopped"
+    
+    if [[ "$success" == true ]]; then
+        print_success "✓ HTTPS is working on localhost"
     else
-        print_warning "No conflicting services found to stop"
+        print_error "✗ HTTPS test failed"
+        return 1
     fi
-
-    debug_log "stop_conflicting_services completed, stopped=$stopped"
-}
-
-#================================================================================
-# DNS RESTRICTION PROMPT
-#================================================================================
-
-prompt_dns_restriction() {
-    print_step "DNS Security Configuration"
-    debug_log "Entering prompt_dns_restriction"
-
-    echo -e "${YELLOW}Restrict port 53 (DNS) to local network only?${NC}"
-    echo ""
-    echo -e "This is a ${GREEN}RECOMMENDED${NC} security setting that:"
-    echo -e "  ${GREEN}✓${NC} Blocks external DNS queries (prevents DNS amplification attacks)"
-    echo -e "  ${GREEN}✓${NC} Keeps unencrypted DNS local to your network"
-    echo -e "  ${GREEN}✓${NC} Still allows encrypted DNS (DoH/DoT/DoQ) from anywhere"
-    echo -e "  ${GREEN}✓${NC} Follows Pi-hole firewall best practices"
-    echo ""
-    echo -e "${CYAN}Detected local subnets:${NC}"
-    for subnet in "${LOCAL_SUBNETS[@]}"; do
-        echo "  - $subnet"
-    done
-    if [[ ${#LOCAL_SUBNETS6[@]} -gt 0 ]]; then
-        echo -e "${CYAN}Detected IPv6 subnets:${NC}"
-        for subnet6 in "${LOCAL_SUBNETS6[@]}"; do
-            echo "  - $subnet6"
-        done
-    fi
-    echo ""
-
-    read -p "Restrict DNS to local network? (Y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Nn]$ ]]; then
-        RESTRICT_DNS="false"
-        print_warning "DNS port 53 will be open to the internet - this is NOT recommended!"
+    
+    # Test via IP
+    local local_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
+    if curl -k -s -o /dev/null -w "%{http_code}" "https://$local_ip:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
+        print_success "✓ HTTPS is working via IP ($local_ip)"
     else
-        RESTRICT_DNS="true"
-        print_success "DNS restricted to local network - recommended setting enabled"
+        print_warning "⚠ HTTPS via IP test failed - check your network"
     fi
-    debug_log "DNS restriction: $RESTRICT_DNS"
+    
     pause
 }
 
 #================================================================================
-# INSTALLATION STATE CHECK
+# MAIN MENU (NEW)
 #================================================================================
 
-check_installed() {
-    debug_log "Entering check_installed"
+show_menu() {
+    clear
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}         Pi-hole Enterprise Encryption Setup v$SCRIPT_VERSION${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${CYAN}GitHub: https://github.com/waelisa/pihole-encryption${NC}"
+    echo ""
+    
+    # Check if already installed
     if [[ -f "$INSTALL_STATE_FILE" ]]; then
-        print_step "Existing Installation Detected"
         source "$INSTALL_STATE_FILE"
-        echo -e "${CYAN}Currently installed:${NC}"
+        echo -e "${YELLOW}Existing installation detected:${NC}"
         echo "  Domain: $INSTALLED_DOMAIN"
         echo "  Web Port: $INSTALLED_WEB_PORT"
-        echo "  Installed on: $INSTALLED_DATE"
+        echo "  Installed: $INSTALLED_DATE"
         echo ""
-        echo "Options:"
-        echo "  1) Reinstall/Update (keeps existing certificates)"
-        echo "  2) Uninstall (remove everything)"
-        echo "  3) Exit"
-        read -p "Choose option (1-3): " install_choice
-
-        case $install_choice in
-            1)
-                print_message "Proceeding with reinstall..."
-                DOMAIN="$INSTALLED_DOMAIN"
-                EMAIL="$INSTALLED_EMAIL"
-                WEB_PORT="$INSTALLED_WEB_PORT"
-                USE_UPNP="$INSTALLED_USE_UPNP"
-                RESTRICT_DNS="${INSTALLED_RESTRICT_DNS:-true}"
-                LETSENCRYPT_DIR="/etc/letsencrypt/live/${DOMAIN}"
-                ;;
-            2)
-                uninstall
-                exit 0
-                ;;
-            3)
-                exit 0
-                ;;
-            *)
-                print_error "Invalid choice"
-                exit 1
-                ;;
-        esac
-        pause
     fi
-    debug_log "No existing installation found"
+    
+    echo -e "${CYAN}Main Menu:${NC}"
+    echo "  1) Fresh Install - Setup encryption with Let's Encrypt"
+    echo "  2) Restore from Backup - Recover previous working configuration"
+    echo "  3) Uninstall - Remove encryption and restore original"
+    echo "  4) Exit"
+    echo ""
+    read -p "Choose option (1-4): " menu_choice
+    
+    case $menu_choice in
+        1)
+            if [[ -f "$INSTALL_STATE_FILE" ]]; then
+                echo ""
+                print_warning "This will overwrite your existing installation"
+                read -p "Continue with fresh install? (y/n): " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    show_menu
+                    return
+                fi
+            fi
+            # Continue with install
+            ;;
+        2)
+            restore_menu
+            ;;
+        3)
+            uninstall
+            exit 0
+            ;;
+        4)
+            exit 0
+            ;;
+        *)
+            print_error "Invalid choice"
+            sleep 2
+            show_menu
+            return
+            ;;
+    esac
+}
+
+restore_menu() {
+    print_step "Available Backups"
+    
+    # Find all backup directories
+    local backups=($(ls -d /root/pihole-encryption-backup-* 2>/dev/null | sort -r))
+    
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        print_error "No backups found in /root/"
+        pause
+        show_menu
+        return
+    fi
+    
+    echo -e "${CYAN}Available backups:${NC}"
+    local i=1
+    for backup in "${backups[@]}"; do
+        echo "  $i) $(basename "$backup")"
+        if [[ -f "$backup/restore.sh" ]]; then
+            echo "     (has restore script)"
+        fi
+        ((i++))
+    done
+    echo "  $i) Back to main menu"
+    echo ""
+    
+    read -p "Choose backup to restore (1-${i}): " backup_choice
+    
+    if [[ "$backup_choice" -eq $i ]]; then
+        show_menu
+        return
+    fi
+    
+    if [[ "$backup_choice" -ge 1 ]] && [[ "$backup_choice" -le ${#backups[@]} ]]; then
+        local selected="${backups[$((backup_choice-1))]}"
+        print_message "Restoring from: $selected"
+        
+        if [[ -f "$selected/restore.sh" ]]; then
+            bash "$selected/restore.sh"
+            print_success "Restore completed"
+        else
+            print_error "Restore script not found in backup"
+        fi
+    else
+        print_error "Invalid choice"
+    fi
+    
+    pause
+    show_menu
 }
 
 #================================================================================
-# PROMPT FUNCTIONS
+# SIMPLIFIED INSTALLATION (NO FIREWALL)
 #================================================================================
 
 prompt_domain() {
     print_step "Domain Configuration"
-    debug_log "Entering prompt_domain"
-
+    
     if [[ -z "$DOMAIN" ]]; then
-        echo -e "${YELLOW}Enter your domain (e.g., dns.example.com):${NC}"
-        read -p "Domain: " DOMAIN
+        read -p "Enter your domain (e.g., dns.example.com): " DOMAIN
         DOMAIN=$(echo "$DOMAIN" | xargs)
     fi
-
+    
     if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
         print_error "Invalid domain format"
         exit 1
     fi
-
+    
     print_success "Domain set to: $DOMAIN"
-    debug_log "Domain: $DOMAIN"
     pause
 }
 
 prompt_email() {
     print_step "Email Configuration"
-    debug_log "Entering prompt_email"
-
+    
     if [[ -z "$EMAIL" ]]; then
-        echo -e "${YELLOW}Enter your email for Let's Encrypt notifications:${NC}"
-        read -p "Email: " EMAIL
+        read -p "Enter your email for Let's Encrypt: " EMAIL
         EMAIL=$(echo "$EMAIL" | xargs)
-        LE_EMAIL="$EMAIL"
     fi
-
+    
     if [[ ! "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
         print_error "Invalid email format"
         exit 1
     fi
-
+    
     print_success "Email set to: $EMAIL"
-    debug_log "Email: $EMAIL"
     pause
 }
 
 get_local_ip() {
-    print_step "Detecting Local IP Address"
-    debug_log "Entering get_local_ip"
-
+    print_step "Detecting Local IP"
+    
     if command -v ip &> /dev/null; then
-        LOCAL_IP=$(ip -4 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
-        LOCAL_IP6=$(ip -6 addr show "$INTERFACE" 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+' | head -n1)
+        LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
     fi
-
+    
     if [[ -z "$LOCAL_IP" ]] && command -v hostname &> /dev/null; then
         LOCAL_IP=$(hostname -I | awk '{print $1}')
     fi
-
+    
     if [[ -z "$LOCAL_IP" ]]; then
         read -p "Enter local IPv4 address: " LOCAL_IP
     fi
-
+    
     print_message "Local IPv4: $LOCAL_IP"
-    if [[ -n "$LOCAL_IP6" ]]; then
-        print_message "Local IPv6: $LOCAL_IP6"
-    fi
     pause
 }
 
 #================================================================================
-# UPnP FUNCTIONS (FIXED SYNTAX)
-#================================================================================
-
-prompt_upnp() {
-    print_step "UPnP Configuration"
-    debug_log "Entering prompt_upnp"
-
-    echo -e "${YELLOW}Enable UPnP port forwarding? (recommended if router supports it)${NC}"
-    echo "UPnP will automatically forward ports on your router:"
-    echo "  - TCP 80/443 -> $LOCAL_IP:80/443 (Let's Encrypt)"
-    echo "  - TCP $WEB_PORT -> $LOCAL_IP:$WEB_PORT (HTTPS/DoH)"
-    echo "  - TCP/UDP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoT/DoQ)"
-
-    if [[ "$RESTRICT_DNS" == "true" ]]; then
-        echo "  - Port 53 will NOT be forwarded (local only - security)"
-    else
-        echo "  - Port 53 will be forwarded (INSECURE)"
-    fi
-
-    echo ""
-    echo -e "${CYAN}UPnP syntax: upnpc -a [internal_ip] [internal_port] [external_port] [protocol]${NC}"
-    echo ""
-
-    read -p "Enable UPnP? (y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        USE_UPNP="true"
-        print_success "UPnP enabled"
-    else
-        USE_UPNP="false"
-        print_message "UPnP disabled - forward ports manually if needed"
-    fi
-    pause
-}
-
-configure_upnp() {
-    print_step "Configuring UPnP Port Forwarding"
-    debug_log "Entering configure_upnp"
-
-    if [[ "$USE_UPNP" != "true" ]] || ! command -v upnpc &> /dev/null; then
-        print_message "UPnP disabled or not available"
-        return
-    fi
-
-    if ! upnpc -l &> /dev/null; then
-        print_error "No UPnP gateway found"
-        return
-    fi
-
-    print_success "UPnP gateway detected"
-
-    # Let's Encrypt ports (TCP)
-    print_message "Forwarding TCP 80 -> $LOCAL_IP:80 (HTTP for Let's Encrypt)"
-    upnpc -a "$LOCAL_IP" 80 80 tcp >> "$LOG_FILE" 2>&1
-
-    print_message "Forwarding TCP 443 -> $LOCAL_IP:443 (HTTPS for Let's Encrypt)"
-    upnpc -a "$LOCAL_IP" 443 443 tcp >> "$LOG_FILE" 2>&1
-
-    # Pi-hole HTTPS/DoH port (TCP)
-    print_message "Forwarding TCP $WEB_PORT -> $LOCAL_IP:$WEB_PORT (HTTPS/DoH)"
-    upnpc -a "$LOCAL_IP" "$WEB_PORT" "$WEB_PORT" tcp >> "$LOG_FILE" 2>&1
-
-    # DNS-over-TLS (TCP)
-    print_message "Forwarding TCP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoT)"
-    upnpc -a "$LOCAL_IP" "$DNS_TLS_PORT" "$DNS_TLS_PORT" tcp >> "$LOG_FILE" 2>&1
-
-    # DNS-over-QUIC (UDP)
-    print_message "Forwarding UDP $DNS_TLS_PORT -> $LOCAL_IP:$DNS_TLS_PORT (DoQ)"
-    upnpc -a "$LOCAL_IP" "$DNS_TLS_PORT" "$DNS_TLS_PORT" udp >> "$LOG_FILE" 2>&1
-
-    # DNS port 53 (only if explicitly allowed - INSECURE)
-    if [[ "$RESTRICT_DNS" == "false" ]]; then
-        print_warning "Forwarding TCP/UDP 53 -> $LOCAL_IP:53 (DNS - INSECURE!)"
-        upnpc -a "$LOCAL_IP" 53 53 tcp >> "$LOG_FILE" 2>&1
-        upnpc -a "$LOCAL_IP" 53 53 udp >> "$LOG_FILE" 2>&1
-    fi
-
-    # Verify rules
-    print_message "Verifying UPnP rules..."
-    upnpc -l | grep -E "80|443|$WEB_PORT|$DNS_TLS_PORT|53" >> "$LOG_FILE" 2>&1
-
-    print_success "UPnP port forwarding configured"
-    pause
-}
-
-setup_upnp_persistence() {
-    if [[ "$USE_UPNP" == "true" ]] && command -v upnpc &> /dev/null; then
-        print_step "Setting UPnP Persistence"
-        debug_log "Entering setup_upnp_persistence"
-
-        cat > /etc/systemd/system/pihole-upnp.service << 'EOF'
-[Unit]
-Description=Pi-hole UPnP Port Forwarding
-After=network.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/pihole-upnp-forward.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        cat > /usr/local/bin/pihole-upnp-forward.sh << EOF
-#!/bin/bash
-LOCAL_IP="$LOCAL_IP"
-WEB_PORT="$WEB_PORT"
-DNS_TLS_PORT="$DNS_TLS_PORT"
-RESTRICT_DNS="$RESTRICT_DNS"
-
-sleep 10
-# Let's Encrypt ports
-upnpc -a "\$LOCAL_IP" 80 80 tcp > /dev/null 2>&1
-upnpc -a "\$LOCAL_IP" 443 443 tcp > /dev/null 2>&1
-
-# Pi-hole encrypted ports
-upnpc -a "\$LOCAL_IP" "\$WEB_PORT" "\$WEB_PORT" tcp > /dev/null 2>&1
-upnpc -a "\$LOCAL_IP" "\$DNS_TLS_PORT" "\$DNS_TLS_PORT" tcp > /dev/null 2>&1
-upnpc -a "\$LOCAL_IP" "\$DNS_TLS_PORT" "\$DNS_TLS_PORT" udp > /dev/null 2>&1
-
-# DNS port 53 - only if explicitly allowed
-if [[ "\$RESTRICT_DNS" == "false" ]]; then
-    upnpc -a "\$LOCAL_IP" 53 53 tcp > /dev/null 2>&1
-    upnpc -a "\$LOCAL_IP" 53 53 udp > /dev/null 2>&1
-fi
-EOF
-
-        chmod +x /usr/local/bin/pihole-upnp-forward.sh
-        systemctl daemon-reload
-        systemctl enable pihole-upnp.service
-        print_success "UPnP persistence configured"
-        pause
-    fi
-}
-
-#================================================================================
-# CONFIGURATION SUMMARY
-#================================================================================
-
-show_config_summary() {
-    print_step "Configuration Summary"
-    debug_log "Entering show_config_summary"
-
-    echo -e "${CYAN}Your Configuration:${NC}"
-    echo "───────────────────────────────────────────────────────"
-    echo -e "  ${YELLOW}Domain:${NC}              $DOMAIN"
-    echo -e "  ${YELLOW}Email:${NC}               $EMAIL"
-    echo -e "  ${YELLOW}Local IP:${NC}            $LOCAL_IP"
-    echo -e "  ${YELLOW}Web/DoH Port:${NC}        $WEB_PORT"
-    echo -e "  ${YELLOW}DoT/DoQ Port:${NC}        $DNS_TLS_PORT"
-    echo -e "  ${YELLOW}Interface:${NC}           $INTERFACE"
-    echo -e "  ${YELLOW}UPnP Enabled:${NC}        $USE_UPNP"
-    echo -e "  ${YELLOW}DNS Restriction:${NC}     $RESTRICT_DNS"
-    echo -e "  ${YELLOW}Firewall:${NC}             $FIREWALL_TYPE"
-    echo "───────────────────────────────────────────────────────"
-    echo ""
-    echo -e "${GREEN}Endpoints:${NC}"
-    echo -e "  ${CYAN}Web Admin:${NC} https://$DOMAIN:$WEB_PORT/admin"
-    echo -e "  ${CYAN}DoH:${NC} https://$DOMAIN:$WEB_PORT/dns-query"
-    echo -e "  ${CYAN}DoT:${NC} tls://$DOMAIN:$DNS_TLS_PORT"
-    echo -e "  ${CYAN}DoQ:${NC} quic://$DOMAIN:$DNS_TLS_PORT"
-    echo ""
-
-    read -p "Continue? (y/n): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 0
-    fi
-}
-
-#================================================================================
-# BACKUP FUNCTIONS
-#================================================================================
-
-create_backup() {
-    print_step "Creating System Backup"
-    debug_log "Entering create_backup"
-
-    mkdir -p "$BACKUP_DIR"
-    print_message "Backup directory: $BACKUP_DIR"
-
-    [[ -f "$PIHOLE_CONFIG" ]] && cp "$PIHOLE_CONFIG" "$BACKUP_DIR/pihole.toml.backup"
-    [[ -d "/etc/letsencrypt" ]] && cp -r "/etc/letsencrypt" "$BACKUP_DIR/letsencrypt.backup" 2>/dev/null || true
-    [[ -f "$PIHOLE_CERT" ]] && cp "$PIHOLE_CERT" "$BACKUP_DIR/tls.pem.backup"
-    [[ -f "$PIHOLE_CA_CERT" ]] && cp "$PIHOLE_CA_CERT" "$BACKUP_DIR/tls_ca.crt.backup"
-
-    cat > "$BACKUP_DIR/installation.state" << EOF
-DOMAIN="$DOMAIN"
-EMAIL="$EMAIL"
-WEB_PORT="$WEB_PORT"
-DNS_TLS_PORT="$DNS_TLS_PORT"
-INTERFACE="$INTERFACE"
-LOCAL_IP="$LOCAL_IP"
-USE_UPNP="$USE_UPNP"
-RESTRICT_DNS="$RESTRICT_DNS"
-INSTALL_DATE="$(date)"
-SCRIPT_VERSION="$SCRIPT_VERSION"
-EOF
-
-    print_success "Backup completed"
-    pause
-}
-
-#================================================================================
-# SERVICE MANAGEMENT FUNCTIONS
-#================================================================================
-
-detect_services_to_restart() {
-    print_step "Detecting Services for Restart"
-    debug_log "Entering detect_services_to_restart"
-
-    SERVICES_TO_RESTART=()
-
-    if systemctl list-units --full -all 2>/dev/null | grep -q "pihole-FTL.service"; then
-        SERVICES_TO_RESTART+=("pihole-FTL")
-        print_message "✓ pihole-FTL detected"
-    fi
-
-    for service in nginx apache2 lighttpd httpd; do
-        if systemctl is-active --quiet "$service" 2>/dev/null; then
-            SERVICES_TO_RESTART+=("$service")
-            print_message "✓ $service detected"
-        fi
-    done
-
-    print_success "Service detection complete"
-    pause
-}
-
-restart_services() {
-    print_step "Restarting Services to Apply New SSL Certificates"
-    debug_log "Entering restart_services"
-
-    for service in "${SERVICES_TO_RESTART[@]}"; do
-        print_message "Restarting $service..."
-
-        if [[ "$service" == "pihole-FTL" ]]; then
-            pihole-FTL --config webserver.tls.cert "$PIHOLE_CERT" >/dev/null 2>&1 || true
-            systemctl restart pihole-FTL
-        else
-            systemctl restart "$service"
-        fi
-
-        sleep 2
-        if systemctl is-active --quiet "$service"; then
-            print_success "✓ $service restarted"
-        fi
-    done
-
-    systemctl daemon-reload 2>/dev/null || true
-    print_success "Service restarts completed"
-    pause
-}
-
-#================================================================================
-# ACME CLIENT FUNCTIONS
-#================================================================================
-
-detect_acme_client() {
-    print_step "Detecting ACME Client"
-    debug_log "Entering detect_acme_client"
-
-    if command -v acme.sh &> /dev/null; then
-        ACME_CLIENT="acme.sh"
-        print_success "acme.sh detected"
-    elif command -v certbot &> /dev/null; then
-        ACME_CLIENT="certbot"
-        print_success "certbot detected"
-    else
-        print_warning "Installing certbot..."
-        case $OS_FAMILY in
-            debian) $INSTALL_CMD certbot >> "$LOG_FILE" 2>&1 ;;
-            rhel|fedora) $INSTALL_CMD certbot >> "$LOG_FILE" 2>&1 ;;
-        esac
-        ACME_CLIENT="certbot"
-    fi
-
-    print_message "Using ACME client: $ACME_CLIENT"
-    pause
-}
-
-#================================================================================
-# SELF-SIGNED CERTIFICATE FUNCTIONS
+# CERTIFICATE FUNCTIONS
 #================================================================================
 
 generate_self_signed_cert() {
-    print_step "Generating Temporary Self-Signed Certificate"
-    debug_log "Entering generate_self_signed_cert"
-
-    print_message "Creating temporary self-signed certificate for domain: $DOMAIN"
-
-    [[ -f "$PIHOLE_CERT" ]] && cp "$PIHOLE_CERT" "${PIHOLE_CERT}.backup-$(date +%Y%m%d_%H%M%S)"
-    [[ -f "$PIHOLE_CA_CERT" ]] && cp "$PIHOLE_CA_CERT" "${PIHOLE_CA_CERT}.backup-$(date +%Y%m%d_%H%M%S)"
-
-    pihole-FTL config webserver.domain "$DOMAIN" >> "$LOG_FILE" 2>&1
+    print_step "Generating Temporary Certificate"
+    
+    print_message "Creating self-signed certificate for: $DOMAIN"
+    
+    # Backup existing certs
+    [[ -f "$PIHOLE_CERT" ]] && cp "$PIHOLE_CERT" "$BACKUP_DIR/tls.pem.pre-selfsigned"
+    [[ -f "$PIHOLE_CA_CERT" ]] && cp "$PIHOLE_CA_CERT" "$BACKUP_DIR/tls_ca.crt.pre-selfsigned"
+    
+    # Set domain and generate cert
+    pihole-FTL config webserver.domain "$DOMAIN"
     rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
     systemctl restart pihole-FTL
     sleep 5
-
+    
     if [[ ! -f "$PIHOLE_CERT" ]] || [[ ! -f "$PIHOLE_CA_CERT" ]]; then
         print_error "Certificate generation failed"
-        exit 1
+        return 1
     fi
-
+    
     chown pihole:pihole "$PIHOLE_CERT" "$PIHOLE_CA_CERT" 2>/dev/null || true
     chmod 600 "$PIHOLE_CERT"
     chmod 644 "$PIHOLE_CA_CERT"
-
+    
     print_success "Self-signed certificate generated"
-    print_message "CA Certificate: $PIHOLE_CA_CERT"
     pause
 }
 
-test_https_with_self_signed() {
-    print_step "Testing HTTPS with Self-Signed Certificate"
-    debug_log "Entering test_https_with_self_signed"
-
-    local max_attempts=12
-    local attempt=1
-    local https_ok=false
-
-    print_message "Testing HTTPS on port $WEB_PORT..."
-
-    while [[ $attempt -le $max_attempts ]]; do
-        sleep 5
-        if curl -k -s -o /dev/null -w "%{http_code}" "https://localhost:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
-            https_ok=true
-            break
-        fi
-        ((attempt++))
-    done
-
-    if [[ "$https_ok" == true ]]; then
-        print_success "✅ HTTPS working (self-signed cert)"
-    else
-        print_warning "⚠️ HTTPS test failed"
-    fi
-    pause
-}
-
-#================================================================================
-# LET'S ENCRYPT FUNCTIONS
-#================================================================================
-
-obtain_certificate() {
+obtain_letsencrypt_cert() {
     print_step "Obtaining Let's Encrypt Certificate"
-    debug_log "Entering obtain_certificate"
-
-    LETSENCRYPT_DIR="/etc/letsencrypt/live/${DOMAIN}"
-
-    if [[ -d "$LETSENCRYPT_DIR" ]]; then
+    
+    local le_dir="/etc/letsencrypt/live/${DOMAIN}"
+    
+    if [[ -d "$le_dir" ]]; then
         print_warning "Certificate already exists"
         read -p "Renew? (y/n): " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            certbot renew --webroot -w "$WEBROOT" --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
-            print_success "Certificate renewed"
+            certbot renew --webroot -w /var/www/html --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
         fi
     else
-        if [[ ! -d "$WEBROOT" ]] || [[ ! -w "$WEBROOT" ]]; then
-            print_error "Webroot not writable"
-            exit 1
-        fi
-
-        print_message "Requesting certificate..."
-        if certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
+        # Ensure webroot exists
+        mkdir -p /var/www/html
+        
+        print_message "Requesting certificate from Let's Encrypt..."
+        if certbot certonly --webroot -w /var/www/html --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
             print_success "Certificate obtained"
         else
             print_error "Failed to obtain certificate"
-            exit 1
+            print_message "Falling back to self-signed certificate"
+            return 1
         fi
     fi
-    pause
-}
-
-combine_certificates() {
-    print_step "Preparing Certificate for Pi-hole"
-    debug_log "Entering combine_certificates"
-
-    if [[ ! -f "${LETSENCRYPT_DIR}/fullchain.pem" ]] || [[ ! -f "${LETSENCRYPT_DIR}/privkey.pem" ]]; then
+    
+    # Combine certificate for Pi-hole
+    if [[ -f "${le_dir}/fullchain.pem" ]] && [[ -f "${le_dir}/privkey.pem" ]]; then
+        cat "${le_dir}/fullchain.pem" "${le_dir}/privkey.pem" > "$PIHOLE_CERT"
+        chown pihole:pihole "$PIHOLE_CERT"
+        chmod 600 "$PIHOLE_CERT"
+        print_success "Certificate installed"
+    else
         print_error "Certificate files not found"
-        exit 1
+        return 1
     fi
-
-    cat "${LETSENCRYPT_DIR}/fullchain.pem" "${LETSENCRYPT_DIR}/privkey.pem" > "${PIHOLE_CERT}"
-    chown pihole:pihole "${PIHOLE_CERT}" 2>/dev/null || true
-    chmod 600 "${PIHOLE_CERT}"
-
-    print_success "Certificate installed at: $PIHOLE_CERT"
-    pause
-}
-
-verify_certificate() {
-    print_step "Verifying SSL Certificate"
-    debug_log "Entering verify_certificate"
-
-    if [[ ! -f "$PIHOLE_CERT" ]] || ! openssl x509 -in "$PIHOLE_CERT" -noout -text > /dev/null 2>&1; then
-        print_error "Certificate verification failed"
-        exit 1
-    fi
-
-    CERT_EXPIRE=$(openssl x509 -in "$PIHOLE_CERT" -enddate -noout | cut -d= -f2)
-    print_success "Certificate valid until: $CERT_EXPIRE"
+    
     pause
 }
 
 #================================================================================
-# PI-HOLE CONFIGURATION FUNCTIONS
+# PI-HOLE CONFIGURATION
 #================================================================================
 
 configure_pihole() {
     print_step "Configuring Pi-hole"
-    debug_log "Entering configure_pihole"
-
+    
+    # Configure webserver
     pihole-FTL config webserver.domain "$DOMAIN"
     pihole-FTL config webserver.tls.cert "$PIHOLE_CERT"
     pihole-FTL config webserver.port "$WEB_PORT"
-    pihole-FTL config webserver.interface "$INTERFACE"
     pihole-FTL config webserver.tls.enable true
-
-    pihole-FTL config dns.port 53
+    
+    # Configure encrypted DNS
     pihole-FTL config dns.dot.enabled true
     pihole-FTL config dns.dot.port "$DNS_TLS_PORT"
     pihole-FTL config dns.dot.cert "$PIHOLE_CERT"
+    
     pihole-FTL config dns.doq.enabled true
     pihole-FTL config dns.doq.port "$DNS_TLS_PORT"
     pihole-FTL config dns.doq.cert "$PIHOLE_CERT"
+    
     pihole-FTL config dns.doh.enabled true
     pihole-FTL config dns.doh.path "/dns-query"
-
+    
+    # Save installation state
     cat > "$INSTALL_STATE_FILE" << EOF
 INSTALLED_DOMAIN="$DOMAIN"
 INSTALLED_EMAIL="$EMAIL"
 INSTALLED_WEB_PORT="$WEB_PORT"
 INSTALLED_DNS_TLS_PORT="$DNS_TLS_PORT"
-INSTALLED_INTERFACE="$INTERFACE"
 INSTALLED_LOCAL_IP="$LOCAL_IP"
 INSTALLED_USE_UPNP="$USE_UPNP"
 INSTALLED_RESTRICT_DNS="$RESTRICT_DNS"
 INSTALLED_DATE="$(date)"
 INSTALLED_VERSION="$SCRIPT_VERSION"
 EOF
-
+    
     print_success "Pi-hole configured"
-    pause
-}
-
-#================================================================================
-# MULTI-FIREWALL CONFIGURATION
-#================================================================================
-
-configure_firewall() {
-    print_step "Configuring Firewall (IPv4/IPv6)"
-    debug_log "Entering configure_firewall"
-
-    case $FIREWALL_TYPE in
-        ufw)
-            configure_firewall_ufw
-            ;;
-        firewalld)
-            configure_firewall_firewalld
-            ;;
-        nftables)
-            configure_firewall_nftables
-            ;;
-        iptables)
-            configure_firewall_iptables
-            ;;
-        *)
-            print_warning "No supported firewall detected"
-            print_firewall_manual_instructions
-            ;;
-    esac
-
-    verify_firewall_rules
-    pause
-}
-
-configure_firewall_ufw() {
-    print_message "Configuring UFW..."
-
-    # IPv4 rules
-    ufw allow 80/tcp comment 'HTTP for Let'"'"'s Encrypt' >> "$LOG_FILE" 2>&1
-    ufw allow 443/tcp comment 'HTTPS for Let'"'"'s Encrypt' >> "$LOG_FILE" 2>&1
-    ufw allow "$WEB_PORT"/tcp comment 'Pi-hole HTTPS/DoH' >> "$LOG_FILE" 2>&1
-    ufw allow "$DNS_TLS_PORT"/tcp comment 'DNS-over-TLS' >> "$LOG_FILE" 2>&1
-    ufw allow "$DNS_TLS_PORT"/udp comment 'DNS-over-QUIC' >> "$LOG_FILE" 2>&1
-
-    # IPv6 rules (if IPv6 is enabled)
-    if [[ ${#LOCAL_SUBNETS6[@]} -gt 0 ]]; then
-        ufw allow 80/tcp comment 'HTTP IPv6' >> "$LOG_FILE" 2>&1
-        ufw allow 443/tcp comment 'HTTPS IPv6' >> "$LOG_FILE" 2>&1
-        ufw allow "$WEB_PORT"/tcp comment 'DoH IPv6' >> "$LOG_FILE" 2>&1
-        ufw allow "$DNS_TLS_PORT"/tcp comment 'DoT IPv6' >> "$LOG_FILE" 2>&1
-        ufw allow "$DNS_TLS_PORT"/udp comment 'DoQ IPv6' >> "$LOG_FILE" 2>&1
-    fi
-
-    # DNS port 53 restriction
-    if [[ "$RESTRICT_DNS" == "true" ]]; then
-        for subnet in "${LOCAL_SUBNETS[@]}"; do
-            ufw allow from "$subnet" to any port 53 proto tcp comment "DNS $subnet" >> "$LOG_FILE" 2>&1
-            ufw allow from "$subnet" to any port 53 proto udp comment "DNS $subnet" >> "$LOG_FILE" 2>&1
-        done
-        for subnet6 in "${LOCAL_SUBNETS6[@]}"; do
-            ufw allow from "$subnet6" to any port 53 proto tcp comment "DNS IPv6" >> "$LOG_FILE" 2>&1
-            ufw allow from "$subnet6" to any port 53 proto udp comment "DNS IPv6" >> "$LOG_FILE" 2>&1
-        done
-    else
-        ufw allow 53/tcp comment 'DNS TCP (INSECURE)' >> "$LOG_FILE" 2>&1
-        ufw allow 53/udp comment 'DNS UDP (INSECURE)' >> "$LOG_FILE" 2>&1
-    fi
-
-    ufw reload >> "$LOG_FILE" 2>&1
-    print_success "UFW configured"
-}
-
-configure_firewall_firewalld() {
-    print_message "Configuring firewalld..."
-
-    # Add services
-    firewall-cmd --permanent --add-service=http --add-service=https >> "$LOG_FILE" 2>&1
-    firewall-cmd --permanent --add-port="$WEB_PORT"/tcp --add-port="$DNS_TLS_PORT"/tcp --add-port="$DNS_TLS_PORT"/udp >> "$LOG_FILE" 2>&1
-
-    if [[ "$RESTRICT_DNS" == "true" ]]; then
-        # Create rich rules for local subnets
-        for subnet in "${LOCAL_SUBNETS[@]}"; do
-            firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$subnet' port port='53' protocol='tcp' accept" >> "$LOG_FILE" 2>&1
-            firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$subnet' port port='53' protocol='udp' accept" >> "$LOG_FILE" 2>&1
-        done
-    else
-        firewall-cmd --permanent --add-service=dns >> "$LOG_FILE" 2>&1
-    fi
-
-    firewall-cmd --reload >> "$LOG_FILE" 2>&1
-    print_success "firewalld configured"
-}
-
-configure_firewall_iptables() {
-    print_message "Configuring iptables (IPv4)..."
-
-    # Flush existing rules
-    iptables -F
-    iptables -X
-
-    # Default policies
-    iptables -P INPUT DROP
-    iptables -P FORWARD DROP
-    iptables -P OUTPUT ACCEPT
-
-    # Allow established connections
-    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    # Allow loopback
-    iptables -A INPUT -i lo -j ACCEPT
-
-    # Allow essential ports
-    iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-    iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-    iptables -A INPUT -p tcp --dport "$WEB_PORT" -j ACCEPT
-    iptables -A INPUT -p tcp --dport "$DNS_TLS_PORT" -j ACCEPT
-    iptables -A INPUT -p udp --dport "$DNS_TLS_PORT" -j ACCEPT
-
-    # DNS port 53 handling
-    if [[ "$RESTRICT_DNS" == "true" ]]; then
-        for subnet in "${LOCAL_SUBNETS[@]}"; do
-            iptables -A INPUT -s "$subnet" -p tcp --dport 53 -j ACCEPT
-            iptables -A INPUT -s "$subnet" -p udp --dport 53 -j ACCEPT
-        done
-    else
-        iptables -A INPUT -p tcp --dport 53 -j ACCEPT
-        iptables -A INPUT -p udp --dport 53 -j ACCEPT
-    fi
-
-    # Save rules
-    if command -v iptables-save &> /dev/null; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-        iptables-save > /etc/iptables/rules 2>/dev/null || true
-    fi
-
-    # IPv6 configuration if available
-    if [[ ${#LOCAL_SUBNETS6[@]} -gt 0 ]] && command -v ip6tables &> /dev/null; then
-        print_message "Configuring ip6tables (IPv6)..."
-
-        ip6tables -F 2>/dev/null || true
-        ip6tables -P INPUT DROP 2>/dev/null || true
-        ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
-
-        ip6tables -A INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p tcp --dport "$WEB_PORT" -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p tcp --dport "$DNS_TLS_PORT" -j ACCEPT 2>/dev/null || true
-        ip6tables -A INPUT -p udp --dport "$DNS_TLS_PORT" -j ACCEPT 2>/dev/null || true
-
-        if [[ "$RESTRICT_DNS" == "true" ]]; then
-            for subnet6 in "${LOCAL_SUBNETS6[@]}"; do
-                ip6tables -A INPUT -s "$subnet6" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-                ip6tables -A INPUT -s "$subnet6" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-            done
-        else
-            ip6tables -A INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-            ip6tables -A INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-        fi
-
-        if command -v ip6tables-save &> /dev/null; then
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-        fi
-    fi
-
-    print_success "iptables configured"
-}
-
-configure_firewall_nftables() {
-    print_message "Configuring nftables..."
-
-    # Create nftables ruleset
-    cat > /etc/nftables.conf << EOF
-#!/usr/sbin/nft -f
-
-flush ruleset
-
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-
-        # Allow established connections
-        ct state established,related accept
-
-        # Allow loopback
-        iif lo accept
-
-        # Allow essential ports
-        tcp dport { 80, 443, $WEB_PORT, $DNS_TLS_PORT } accept
-        udp dport $DNS_TLS_PORT accept
-
-        # DNS port 53
-EOF
-
-    if [[ "$RESTRICT_DNS" == "true" ]]; then
-        for subnet in "${LOCAL_SUBNETS[@]}"; do
-            echo "        ip saddr $subnet tcp dport 53 accept" >> /etc/nftables.conf
-            echo "        ip saddr $subnet udp dport 53 accept" >> /etc/nftables.conf
-        done
-        for subnet6 in "${LOCAL_SUBNETS6[@]}"; do
-            echo "        ip6 saddr $subnet6 tcp dport 53 accept" >> /etc/nftables.conf
-            echo "        ip6 saddr $subnet6 udp dport 53 accept" >> /etc/nftables.conf
-        done
-    else
-        echo "        tcp dport 53 accept" >> /etc/nftables.conf
-        echo "        udp dport 53 accept" >> /etc/nftables.conf
-    fi
-
-    cat >> /etc/nftables.conf << EOF
-    }
-
-    chain forward {
-        type filter hook forward priority 0; policy drop;
-    }
-
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-EOF
-
-    systemctl restart nftables >> "$LOG_FILE" 2>&1
-    print_success "nftables configured"
-}
-
-verify_firewall_rules() {
-    print_step "Verifying Firewall Rules"
-    debug_log "Entering verify_firewall_rules"
-
-    local ports_to_verify=(80 443 "$WEB_PORT" "$DNS_TLS_PORT")
-
-    for port in "${ports_to_verify[@]}"; do
-        if iptables -L -n 2>/dev/null | grep -q ":$port "; then
-            print_success "✓ Port $port/tcp rule present"
-        elif ufw status 2>/dev/null | grep -q "$port"; then
-            print_success "✓ Port $port/tcp rule present (UFW)"
-        elif firewall-cmd --list-ports 2>/dev/null | grep -q "$port"; then
-            print_success "✓ Port $port/tcp rule present (firewalld)"
-        else
-            print_warning "⚠ Could not verify port $port rule"
-        fi
-    done
-
-    pause
-}
-
-print_firewall_manual_instructions() {
-    echo ""
-    echo -e "${YELLOW}Manual Firewall Configuration Required:${NC}"
-    echo ""
-    echo "Open these ports to the internet (for Let's Encrypt and encrypted DNS):"
-    echo "  - TCP 80, 443"
-    echo "  - TCP $WEB_PORT, $DNS_TLS_PORT"
-    echo "  - UDP $DNS_TLS_PORT"
-    echo ""
-
-    if [[ "$RESTRICT_DNS" == "true" ]]; then
-        echo "Restrict port 53 (DNS) to these local subnets:"
-        for subnet in "${LOCAL_SUBNETS[@]}"; do
-            echo "  - $subnet"
-        done
-        for subnet6 in "${LOCAL_SUBNETS6[@]}"; do
-            echo "  - $subnet6"
-        done
-    else
-        echo -e "${RED}WARNING: Port 53 is open to the internet (INSECURE)${NC}"
-        echo "Open TCP/UDP 53 to all"
-    fi
-}
-
-#================================================================================
-# WEBROOT SETUP
-#================================================================================
-
-setup_webroot() {
-    print_step "Setting Up Webroot for Let's Encrypt"
-    debug_log "Entering setup_webroot"
-
-    mkdir -p "$WEBROOT"
-    chmod 755 "$WEBROOT"
-
-    local index_file="$WEBROOT/index.html"
-    local backup_index="$WEBROOT/index.html.backup-$(date +%Y%m%d_%H%M%S)"
-
-    if [[ -f "$index_file" ]] && ! grep -q "Pi-hole Encryption" "$index_file"; then
-        cp "$index_file" "$backup_index"
-        print_message "Backed up existing index.html"
-    fi
-
-    cat > "$index_file" << EOF
-<!DOCTYPE html>
-<html>
-<head><title>Pi-hole Encryption</title></head>
-<body>
-    <h1>🔒 Pi-hole Encryption Setup</h1>
-    <p>Domain: $DOMAIN</p>
-    <p>Web Admin: https://$DOMAIN:$WEB_PORT/admin</p>
-    <p>DoH: https://$DOMAIN:$WEB_PORT/dns-query</p>
-    <p>DoT: tls://$DOMAIN:$DNS_TLS_PORT</p>
-    <p>DoQ: quic://$DOMAIN:$DNS_TLS_PORT</p>
-    <p>Generated: $(date)</p>
-</body>
-</html>
-EOF
-
-    chmod 644 "$index_file"
-    print_success "Test page created at: $index_file"
     pause
 }
 
@@ -2059,12 +608,11 @@ EOF
 # RENEWAL SETUP
 #================================================================================
 
-setup_acme_renewal() {
-    print_step "Configuring Automatic Renewal"
-    debug_log "Entering setup_acme_renewal"
-
+setup_renewal() {
+    print_step "Configuring Auto-Renewal"
+    
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-
+    
     cat > "$RENEWAL_HOOK" << EOF
 #!/bin/bash
 DOMAIN="\$RENEWED_DOMAINS"
@@ -2077,214 +625,122 @@ if [ -d "/etc/letsencrypt/live/\$DOMAIN" ]; then
     logger "Pi-hole: Certificate renewed for \$DOMAIN"
 fi
 EOF
-
+    
     chmod +x "$RENEWAL_HOOK"
-    certbot renew --dry-run >> "$LOG_FILE" 2>&1 || true
     print_success "Auto-renewal configured"
     pause
 }
 
 #================================================================================
-# VERIFICATION FUNCTIONS
-#================================================================================
-
-verify_endpoints() {
-    print_step "Verifying Encryption Endpoints"
-    debug_log "Entering verify_endpoints"
-
-    sleep 5
-
-    print_message "Testing HTTPS web interface..."
-    if curl -k -s -o /dev/null -w "%{http_code}" "https://localhost:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
-        print_success "✓ HTTPS web interface accessible"
-    fi
-
-    print_message "Testing DoH endpoint..."
-    if curl -k -s -o /dev/null -w "%{http_code}" -H "content-type: application/dns-message" "https://localhost:$WEB_PORT/dns-query" 2>/dev/null; then
-        print_success "✓ DoH endpoint responding"
-    fi
-
-    print_message "Testing TLS endpoint..."
-    if timeout 5 openssl s_client -connect "localhost:$DNS_TLS_PORT" -tls1_3 -servername "$DOMAIN" 2>&1 | grep -q "CONNECTED"; then
-        print_success "✓ TLS endpoint available"
-    fi
-
-    echo ""
-    echo -e "${GREEN}Your endpoints:${NC}"
-    echo -e "  ${CYAN}Web:${NC} https://$DOMAIN:$WEB_PORT/admin"
-    echo -e "  ${CYAN}DoH:${NC} https://$DOMAIN:$WEB_PORT/dns-query"
-    echo -e "  ${CYAN}DoT:${NC} tls://$DOMAIN:$DNS_TLS_PORT"
-    echo -e "  ${CYAN}DoQ:${NC} quic://$DOMAIN:$DNS_TLS_PORT"
-    echo ""
-    pause
-}
-
-#================================================================================
-# BROWSER INSTRUCTIONS
-#================================================================================
-
-print_browser_instructions() {
-    print_step "Browser Configuration Tips"
-    debug_log "Entering print_browser_instructions"
-
-    echo -e "${CYAN}Browser-Specific DoH Configuration:${NC}"
-    echo ""
-    echo -e "${YELLOW}Firefox:${NC}"
-    echo "  Settings → Network Settings → Enable DNS over HTTPS"
-    echo "  Provider: Custom → https://$DOMAIN:$WEB_PORT/dns-query"
-    echo ""
-    echo -e "${YELLOW}Chrome/Edge:${NC}"
-    echo "  Settings → Privacy and security → Security"
-    echo "  Use secure DNS → Custom: $DOMAIN:$WEB_PORT"
-    echo "  Note: Chrome may require the port to be 443 for some configurations"
-    echo ""
-    echo -e "${YELLOW}Android:${NC}"
-    echo "  Settings → Network & Internet → Private DNS"
-    echo "  Private DNS provider hostname: $DOMAIN (uses DoT on port 853)"
-    echo ""
-    echo -e "${YELLOW}Windows 11:${NC}"
-    echo "  Settings → Network & Internet → DNS over HTTPS"
-    echo "  Manual template: https://$DOMAIN:$WEB_PORT/dns-query"
-    echo ""
-
-    pause
-}
-
-#================================================================================
-# SUMMARY FUNCTION
-#================================================================================
-
-print_summary() {
-    print_step "Setup Complete - Summary"
-    debug_log "Entering print_summary"
-
-    PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || echo "Unable to detect")
-
-    echo -e "${GREEN}✓ Pi-hole Encryption Setup Complete!${NC}"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Your Configuration:${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Domain:${NC}      $DOMAIN"
-    echo -e "  ${YELLOW}Public IP:${NC}   $PUBLIC_IP"
-    echo -e "  ${YELLOW}Local IP:${NC}    $LOCAL_IP"
-    echo ""
-    echo -e "  ${YELLOW}Web Admin:${NC}   https://$DOMAIN:$WEB_PORT/admin"
-    echo -e "  ${YELLOW}DoH:${NC}         https://$DOMAIN:$WEB_PORT/dns-query"
-    echo -e "  ${YELLOW}DoT:${NC}         tls://$DOMAIN:$DNS_TLS_PORT"
-    echo -e "  ${YELLOW}DoQ:${NC}         quic://$DOMAIN:$DNS_TLS_PORT"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Security Status:${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    if [[ "$RESTRICT_DNS" == "true" ]]; then
-        echo -e "  ${GREEN}✓ DNS port 53 RESTRICTED to:${NC}"
-        for subnet in "${LOCAL_SUBNETS[@]}"; do
-            echo -e "    - $subnet"
-        done
-    else
-        echo -e "  ${RED}⚠ DNS port 53 OPEN to internet (INSECURE)${NC}"
-    fi
-    echo -e "  ${GREEN}✓ Encrypted ports open globally${NC}"
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Backup:${NC} $BACKUP_DIR"
-    echo -e "${GREEN}Log:${NC}    $LOG_FILE"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-}
-
-#================================================================================
-# UNINSTALL FUNCTION
+# UNINSTALL
 #================================================================================
 
 uninstall() {
-    print_section "Uninstalling Pi-hole Encryption"
-    debug_log "Entering uninstall"
-
-    echo -e "${YELLOW}Options for HTTPS after uninstall:${NC}"
+    print_step "Uninstalling Encryption"
+    
+    # Ask about HTTPS after uninstall
+    echo -e "${YELLOW}What would you like to do with HTTPS after uninstall?${NC}"
     echo "  1) Restore original (no HTTPS)"
-    echo "  2) Create new self-signed cert"
+    echo "  2) Keep self-signed certificate"
     echo "  3) Keep Let's Encrypt"
     read -p "Choose (1-3): " uninstall_choice
-
+    
     case $uninstall_choice in
         1)
-            if [[ -f "$BACKUP_DIR/pihole.toml.backup" ]]; then
-                cp "$BACKUP_DIR/pihole.toml.backup" "$PIHOLE_CONFIG"
-            else
-                systemctl stop pihole-FTL
-                pihole-FTL config webserver.port 80 2>/dev/null || true
-                pihole-FTL config webserver.tls.enable false 2>/dev/null || true
-            fi
+            pihole-FTL config webserver.tls.enable false
+            pihole-FTL config webserver.port "80"
+            pihole-FTL config dns.dot.enabled false
+            pihole-FTL config dns.doq.enabled false
+            pihole-FTL config dns.doh.enabled false
+            rm -f "$PIHOLE_CERT" "$PIHOLE_CA_CERT"
+            print_success "HTTPS disabled"
             ;;
         2)
-            systemctl stop pihole-FTL
-            rm -f /etc/pihole/tls*
-            systemctl start pihole-FTL
-            sleep 5
-            print_success "New self-signed certificate created"
+            # Keep self-signed, just disable auto-renewal
+            pihole-FTL config webserver.port "$WEB_PORT"
+            print_success "Keeping self-signed certificate"
             ;;
         3)
-            print_message "Keeping Let's Encrypt certificate"
+            # Keep Let's Encrypt
+            print_success "Keeping Let's Encrypt certificate"
             ;;
     esac
-
-    # Remove UPnP rules
-    if command -v upnpc &> /dev/null && [[ "$USE_UPNP" == "true" ]]; then
-        print_message "Removing UPnP port forwarding rules..."
-        upnpc -d 80 tcp 2>/dev/null || true
-        upnpc -d 443 tcp 2>/dev/null || true
-        upnpc -d "$WEB_PORT" tcp 2>/dev/null || true
-        upnpc -d "$DNS_TLS_PORT" tcp 2>/dev/null || true
-        upnpc -d "$DNS_TLS_PORT" udp 2>/dev/null || true
-    fi
-
-    # Remove systemd service
-    [[ -f "/etc/systemd/system/pihole-upnp.service" ]] && systemctl disable --now pihole-upnp.service && rm /etc/systemd/system/pihole-upnp.service
-
-    # Remove renewal hooks
+    
+    # Remove renewal hook
     [[ -f "$RENEWAL_HOOK" ]] && rm "$RENEWAL_HOOK"
-
-    # Remove installation state
+    
+    # Remove state file
     [[ -f "$INSTALL_STATE_FILE" ]] && rm "$INSTALL_STATE_FILE"
-
+    
     systemctl restart pihole-FTL
-    print_success "Uninstallation completed"
+    print_success "Uninstall completed"
 }
 
 #================================================================================
-# VERIFY ALL FUNCTIONS EXIST
+# MAIN INSTALLATION
 #================================================================================
 
-verify_functions() {
-    debug_log "Verifying all required functions exist"
-
-    local required_functions=(
-        "check_root" "detect_os" "install_dependencies" "detect_firewall"
-        "check_pihole_version" "check_installed" "prompt_domain" "prompt_email"
-        "get_local_ip" "choose_ports" "test_ports" "stop_conflicting_services"
-        "detect_local_subnets" "prompt_dns_restriction" "prompt_upnp"
-        "setup_webroot" "generate_self_signed_cert" "test_https_with_self_signed"
-        "show_config_summary" "create_backup" "create_teleporter_backup"
-        "detect_services_to_restart" "detect_acme_client" "obtain_certificate"
-        "combine_certificates" "verify_certificate" "configure_pihole"
-        "configure_firewall" "configure_upnp" "setup_upnp_persistence"
-        "restart_services" "setup_acme_renewal" "verify_endpoints"
-        "test_doh_endpoint" "print_browser_instructions" "print_summary"
-        "uninstall" "validate_pihole_services" "attempt_service_recovery"
-    )
-
-    for func in "${required_functions[@]}"; do
-        if ! declare -f "$func" > /dev/null; then
-            print_error "Required function '$func' is missing!"
-            exit 1
+main_install() {
+    print_step "Starting Installation"
+    
+    # Step 1: Create backup FIRST (before any changes)
+    create_backup
+    
+    # Step 2: Get configuration
+    prompt_domain
+    prompt_email
+    get_local_ip
+    
+    # Step 3: Verify domain resolves (optional but helpful)
+    verify_domain_resolution
+    
+    # Step 4: Generate self-signed cert
+    generate_self_signed_cert || {
+        print_error "Self-signed certificate failed"
+        restore_from_backup
+        exit 1
+    }
+    
+    # Step 5: Validate HTTPS with self-signed
+    validate_https || {
+        print_error "HTTPS validation failed with self-signed cert"
+        restore_from_backup
+        exit 1
+    }
+    
+    # Step 6: Get Let's Encrypt certificate
+    obtain_letsencrypt_cert || {
+        print_warning "Using self-signed certificate (Let's Encrypt failed)"
+    }
+    
+    # Step 7: Configure Pi-hole
+    configure_pihole
+    
+    # Step 8: Restart and validate
+    systemctl restart pihole-FTL
+    sleep 5
+    
+    validate_https || {
+        print_error "HTTPS validation failed after configuration"
+        print_message "Would you like to restore from backup?"
+        read -p "Restore? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            restore_from_backup
         fi
-    done
-
-    print_success "All functions verified"
+        exit 1
+    }
+    
+    # Step 9: Setup renewal
+    setup_renewal
+    
+    # Final success message
+    echo ""
+    print_success "🎉 Installation complete!"
+    echo -e "${GREEN}Access your Pi-hole:${NC} https://$DOMAIN:$WEB_PORT/admin"
+    echo -e "${GREEN}Backup location:${NC} $BACKUP_DIR"
+    echo -e "${GREEN}To restore:${NC} sudo $BACKUP_DIR/restore.sh"
+    echo ""
 }
 
 #================================================================================
@@ -2294,12 +750,14 @@ verify_functions() {
 main() {
     case $1 in
         --uninstall)
-            if [[ -f "$INSTALL_STATE_FILE" ]]; then
-                source "$INSTALL_STATE_FILE"
-                uninstall
+            uninstall
+            exit 0
+            ;;
+        --restore)
+            if [[ -d "$2" ]]; then
+                bash "$2/restore.sh"
             else
-                print_error "No installation found to uninstall"
-                exit 1
+                print_error "Please specify backup directory: $0 --restore /path/to/backup"
             fi
             exit 0
             ;;
@@ -2308,9 +766,10 @@ main() {
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --uninstall     Remove encryption and restore original configuration"
-            echo "  --help          Show this help message"
-            echo "  --version       Show script version"
+            echo "  --uninstall           Remove encryption"
+            echo "  --restore <backupdir> Restore from backup"
+            echo "  --help                Show this help"
+            echo "  --version             Show version"
             exit 0
             ;;
         --version)
@@ -2318,86 +777,12 @@ main() {
             exit 0
             ;;
     esac
-
-    # Display banner
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}         Pi-hole Enterprise Encryption Setup (DoH/DoT/DoQ) v$SCRIPT_VERSION${NC}"
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}GitHub: https://github.com/waelisa/pihole-encryption${NC}"
-    echo ""
-    echo -e "This LEGACY RELEASE will configure your Pi-hole with:"
-    echo -e "  • HTTPS web interface with Let's Encrypt"
-    echo -e "  • DNS-over-HTTPS (DoH) - Encrypted DNS queries"
-    echo -e "  • DNS-over-TLS (DoT) - Alternative encrypted transport"
-    echo -e "  • DNS-over-QUIC (DoQ) - Modern UDP-based encryption"
-    echo -e "  • DNS restriction - Block external unencrypted queries (RECOMMENDED)"
-    echo -e "  • Full IPv4/IPv6 support"
-    echo -e "  • Multi-firewall support (UFW/firewalld/iptables/nftables)"
-    echo -e "  • Works on minimal OS installs (all dependencies included)"
-    echo -e "  • FUTURE-PROOF: Works with Pi-hole v6, v7, v8+"
-    echo -e "  • SERVICE RECOVERY: Automatically fixes lighttpd conflicts"
-    echo -e "  • UPnP SYNTAX: upnpc -a [ip] [int_port] [ext_port] [proto]"
-    echo ""
-    echo -e "${YELLOW}Total steps: $TOTAL_STEPS${NC}"
-    echo ""
-
-    verify_functions
-    read -p "Press Enter to start..." -r
-
-    # Core execution flow
-    check_root
-    detect_os
-    install_dependencies
-    detect_firewall
-    check_pihole_version
-    check_installed
-
-    # NEW: Validate Pi-hole services before proceeding
-    validate_pihole_services
-
-    prompt_domain
-    prompt_email
-    get_local_ip
-    choose_ports
-    test_ports
-    detect_local_subnets
-    prompt_dns_restriction
-    prompt_upnp
-
-    setup_webroot
-    generate_self_signed_cert
-    test_https_with_self_signed
-
-    show_config_summary
-    create_backup
-    create_teleporter_backup
-    detect_services_to_restart
-    detect_acme_client
-
-    LETSENCRYPT_DIR="/etc/letsencrypt/live/${DOMAIN}"
-    obtain_certificate
-    combine_certificates
-    verify_certificate
-
-    configure_pihole
-    configure_firewall
-    configure_upnp
-    setup_upnp_persistence
-
-    restart_services
-    setup_acme_renewal
-    verify_endpoints
-    test_doh_endpoint
-    print_browser_instructions
-    print_summary
-
-    echo ""
-    print_success "🎉 Setup complete! Your Pi-hole is now secured."
-    echo -e "${GREEN}Access:${NC} https://$DOMAIN:$WEB_PORT/admin"
-    echo ""
-    echo -e "${YELLOW}Note: This script will work with future Pi-hole versions (v7, v8, etc.)${NC}"
-    echo -e "${YELLOW}Thank you for using Pi-hole Encryption Setup v$SCRIPT_VERSION!${NC}"
-    echo ""
+    
+    # Show interactive menu
+    show_menu
+    
+    # Run installation
+    main_install
 }
 
 # Run main

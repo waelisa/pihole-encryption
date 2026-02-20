@@ -4,21 +4,20 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.2.1
+# Version: 1.2.2
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.2.1 - FIXED: HTTPS validation logic - NOW ASKS BEFORE RESTORING!
-#        ✅ Fixed: Proper HTTP status code checking (200, 302, 401 all accepted)
-#        ✅ Fixed: Added timeout controls to prevent hanging
-#        ✅ Fixed: Now ASKS user before restoring from backup (no auto-restore!)
-#        ✅ Added: Multiple validation methods (curl, wget, openssl s_client)
-#        ✅ Added: Connection refused vs connection timeout detection
+# v1.2.2 - IMPROVED: Let's Encrypt certificate handling
+#        ✅ Fixed: Proper certificate combination for Pi-hole v6.5
+#        ✅ Added: DNS-01 challenge support for providers
+#        ✅ Added: Certificate format validation
 #        ✅ Added: Better error messages with specific failure reasons
-#        ✅ Added: Option to continue even if validation fails
+#        ✅ Added: Option to test different validation methods
+#        ✅ Fixed: Permissions and ownership for certificate files
 #
 #############################################################################################################################
 
@@ -38,7 +37,7 @@ WEB_PORT="443"
 DNS_TLS_PORT="853"
 INTERFACE="eth0"
 LOCAL_IP=""
-USE_UPNP=""
+USE_UPNP="false"
 RESTRICT_DNS="true"
 
 # Pi-hole version info
@@ -50,7 +49,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 
@@ -174,11 +173,17 @@ verify_certificate_files() {
     else
         local size=$(stat -c%s "$PIHOLE_CERT" 2>/dev/null || stat -f%z "$PIHOLE_CERT" 2>/dev/null)
         print_message "Certificate size: $size bytes"
-        if [[ $size -lt 100 ]]; then
+        if [[ $size -lt 500 ]]; then
             print_error "Certificate file too small (likely invalid)"
             ((errors++))
         else
-            print_success "✓ Certificate file exists and has valid size"
+            # Check if it's a valid PEM file
+            if openssl x509 -in "$PIHOLE_CERT" -noout 2>/dev/null; then
+                print_success "✓ Certificate is valid PEM format"
+            else
+                print_error "Certificate is not valid PEM format"
+                ((errors++))
+            fi
         fi
     fi
     
@@ -202,7 +207,7 @@ verify_certificate_files() {
 }
 
 #================================================================================
-# IMPROVED HTTPS VALIDATION (FIXED in v1.2.1)
+# IMPROVED HTTPS VALIDATION
 #================================================================================
 
 check_http_status() {
@@ -226,19 +231,6 @@ check_http_status() {
             return 1
         else
             echo "CURL_ERROR_$curl_exit"
-            return 1
-        fi
-    fi
-    
-    # Fallback to wget
-    if command -v wget &> /dev/null; then
-        if wget --no-check-certificate -T "$timeout" -t 1 -S --spider "$url" 2>&1 | grep -q "HTTP/"; then
-            local status
-            status=$(wget --no-check-certificate -T "$timeout" -t 1 -S --spider "$url" 2>&1 | grep "HTTP/" | awk '{print $2}' | head -1)
-            echo "$status"
-            return 0
-        else
-            echo "WGET_FAILED"
             return 1
         fi
     fi
@@ -641,7 +633,7 @@ show_menu() {
     # Check if already installed
     if [[ -f "$INSTALL_STATE_FILE" ]]; then
         source "$INSTALL_STATE_FILE"
-        echo -e ${YELLOW}Existing installation detected:${NC}
+        echo -e "${YELLOW}Existing installation detected:${NC}"
         echo "  Domain: $INSTALLED_DOMAIN"
         echo "  Web Port: $INSTALLED_WEB_PORT"
         echo "  Installed: $INSTALLED_DATE"
@@ -838,10 +830,59 @@ generate_self_signed_cert() {
     pause
 }
 
+#================================================================================
+# IMPROVED LET'S ENCRYPT FUNCTION (v1.2.2)
+#================================================================================
+
+validate_certificate_format() {
+    local cert_file="$1"
+    
+    # Check if it's a valid PEM file
+    if ! openssl x509 -in "$cert_file" -noout 2>/dev/null; then
+        return 1
+    fi
+    
+    # Check if it contains both certificate and private key
+    if grep -q "BEGIN RSA PRIVATE KEY\|BEGIN PRIVATE KEY" "$cert_file" && grep -q "BEGIN CERTIFICATE" "$cert_file"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+combine_certificates() {
+    local le_dir="/etc/letsencrypt/live/${DOMAIN}"
+    local combined_cert="$PIHOLE_CERT"
+    
+    if [[ -f "${le_dir}/fullchain.pem" ]] && [[ -f "${le_dir}/privkey.pem" ]]; then
+        print_message "Combining certificate and private key..."
+        
+        # Create combined file
+        cat "${le_dir}/fullchain.pem" "${le_dir}/privkey.pem" > "${combined_cert}.tmp"
+        
+        # Verify the combined format
+        if validate_certificate_format "${combined_cert}.tmp"; then
+            mv "${combined_cert}.tmp" "$combined_cert"
+            chown pihole:pihole "$combined_cert" 2>/dev/null || true
+            chmod 600 "$combined_cert"
+            print_success "✓ Certificate combined successfully"
+            return 0
+        else
+            print_error "Combined certificate format is invalid"
+            rm -f "${combined_cert}.tmp"
+            return 1
+        fi
+    fi
+    
+    return 1
+}
+
 obtain_letsencrypt_cert() {
     print_step "Obtaining Let's Encrypt Certificate"
     
     local le_dir="/etc/letsencrypt/live/${DOMAIN}"
+    local combined_cert="$PIHOLE_CERT"
+    local public_ip=""
     
     # Check if certbot is installed
     if ! command -v certbot &> /dev/null; then
@@ -850,40 +891,199 @@ obtain_letsencrypt_cert() {
         apt-get install -y certbot > /dev/null 2>&1
     fi
     
+    # Get public IP for information
+    if command -v curl &> /dev/null; then
+        public_ip=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
+    fi
+    
+    print_message "Your public IP appears to be: $public_ip"
+    print_message "Make sure your domain $DOMAIN points to this IP"
+    echo ""
+    
     # Ensure webroot exists
     mkdir -p /var/www/html
     
-    if [[ -d "$le_dir" ]]; then
-        print_warning "Certificate already exists"
-        read -p "Renew? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            print_message "Renewing certificate..."
-            certbot renew --webroot -w /var/www/html --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
-        fi
-    else
-        print_message "Requesting certificate from Let's Encrypt..."
-        if certbot certonly --webroot -w /var/www/html --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
-            print_success "Certificate obtained"
+    # Create a simple test page for Let's Encrypt verification
+    echo "Pi-hole Let's Encrypt Validation" > /var/www/html/index.html
+    
+    # Check if certificate already exists
+    if [[ -d "$le_dir" ]] && [[ -f "${le_dir}/fullchain.pem" ]]; then
+        print_warning "Certificate already exists for $DOMAIN"
+        echo ""
+        echo "Options:"
+        echo "  1) Renew existing certificate"
+        echo "  2) Request new certificate (force)"
+        echo "  3) Skip and use self-signed"
+        echo ""
+        read -p "Choose (1-3): " cert_choice
+        
+        case $cert_choice in
+            1)
+                print_message "Renewing certificate..."
+                certbot renew --webroot -w /var/www/html --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
+                if [[ $? -eq 0 ]]; then
+                    print_success "Certificate renewed"
+                else
+                    print_error "Renewal failed"
+                    return 1
+                fi
+                ;;
+            2)
+                print_message "Requesting new certificate..."
+                certbot delete --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1
+                ;;
+            3)
+                print_warning "Skipping Let's Encrypt, using self-signed"
+                return 1
+                ;;
+        esac
+    fi
+    
+    # If we don't have a certificate yet, request one
+    if [[ ! -d "$le_dir" ]] || [[ ! -f "${le_dir}/fullchain.pem" ]]; then
+        echo ""
+        print_message "Let's Encrypt needs to verify you control $DOMAIN"
+        print_message "Choose verification method:"
+        echo "  1) HTTP-01 challenge (requires port 80 publicly accessible)"
+        echo "  2) DNS-01 challenge (requires DNS API access)"
+        echo "  3) Manual DNS (create TXT record yourself)"
+        echo "  4) Skip Let's Encrypt (use self-signed)"
+        echo ""
+        read -p "Choose method (1-4): " le_method
+        
+        case $le_method in
+            1)
+                print_message "Attempting HTTP-01 challenge..."
+                if certbot certonly --webroot -w /var/www/html --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
+                    print_success "Certificate obtained via HTTP-01"
+                else
+                    print_error "HTTP-01 challenge failed"
+                    print_message "Common reasons:"
+                    echo "  • Port 80 is not accessible from internet"
+                    echo "  • Domain $DOMAIN doesn't point to this server"
+                    echo "  • Firewall is blocking port 80"
+                    echo ""
+                    read -p "Try DNS-01 method instead? (y/n): " try_dns
+                    if [[ $try_dns =~ ^[Yy]$ ]]; then
+                        le_method=2
+                    else
+                        return 1
+                    fi
+                fi
+                ;;
+                
+            2)
+                print_message "DNS-01 challenge selected"
+                print_message "Installing certbot DNS plugins..."
+                apt-get update > /dev/null 2>&1
+                
+                echo ""
+                print_message "Select your DNS provider:"
+                echo "  1) Cloudflare"
+                echo "  2) OVH"
+                echo "  3) DigitalOcean"
+                echo "  4) GoDaddy"
+                echo "  5) Namecheap"
+                echo "  6) Other (manual mode)"
+                echo ""
+                read -p "Choose (1-6): " dns_provider
+                
+                case $dns_provider in
+                    1)
+                        apt-get install -y python3-certbot-dns-cloudflare >> "$LOG_FILE" 2>&1
+                        echo ""
+                        print_message "Cloudflare API Token needed"
+                        print_message "Create a token at: https://dash.cloudflare.com/profile/api-tokens"
+                        echo "Token needs permissions: Zone:Read, DNS:Edit"
+                        echo ""
+                        read -p "Enter Cloudflare API token: " cf_token
+                        mkdir -p ~/.secrets
+                        echo "dns_cloudflare_api_token = $cf_token" > ~/.secrets/cloudflare.ini
+                        chmod 600 ~/.secrets/cloudflare.ini
+                        
+                        certbot certonly --dns-cloudflare --dns-cloudflare-credentials ~/.secrets/cloudflare.ini -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL" >> "$LOG_FILE" 2>&1
+                        ;;
+                        
+                    2)
+                        apt-get install -y python3-certbot-dns-ovh >> "$LOG_FILE" 2>&1
+                        print_message "OVH requires application key and secret"
+                        echo "Please create credentials at: https://www.ovh.com/auth/api/createToken"
+                        echo ""
+                        read -p "Enter OVH application key: " ovh_key
+                        read -p "Enter OVH application secret: " ovh_secret
+                        read -p "Enter OVH consumer key: " ovh_ck
+                        
+                        mkdir -p ~/.secrets
+                        cat > ~/.secrets/ovh.ini << OVHEOF
+dns_ovh_endpoint = ovh-eu
+dns_ovh_application_key = $ovh_key
+dns_ovh_application_secret = $ovh_secret
+dns_ovh_consumer_key = $ovh_ck
+OVHEOF
+                        chmod 600 ~/.secrets/ovh.ini
+                        
+                        certbot certonly --dns-ovh --dns-ovh-credentials ~/.secrets/ovh.ini -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL" >> "$LOG_FILE" 2>&1
+                        ;;
+                        
+                    3)
+                        apt-get install -y python3-certbot-dns-digitalocean >> "$LOG_FILE" 2>&1
+                        print_message "DigitalOcean API token needed"
+                        echo "Create token at: https://cloud.digitalocean.com/account/api/tokens"
+                        echo ""
+                        read -p "Enter DigitalOcean API token: " do_token
+                        
+                        mkdir -p ~/.secrets
+                        echo "dns_digitalocean_token = $do_token" > ~/.secrets/digitalocean.ini
+                        chmod 600 ~/.secrets/digitalocean.ini
+                        
+                        certbot certonly --dns-digitalocean --dns-digitalocean-credentials ~/.secrets/digitalocean.ini -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL" >> "$LOG_FILE" 2>&1
+                        ;;
+                        
+                    *)
+                        print_message "Manual DNS mode selected"
+                        print_message "Run this command manually:"
+                        echo "  certbot certonly --manual --preferred-challenges dns -d $DOMAIN --email $EMAIL --agree-tos"
+                        echo ""
+                        read -p "Press Enter after obtaining certificate manually..."
+                        ;;
+                esac
+                ;;
+                
+            3)
+                print_message "Manual DNS challenge selected"
+                print_message "You will need to create a TXT record in your DNS"
+                echo ""
+                certbot certonly --manual --preferred-challenges dns -d "$DOMAIN" --email "$EMAIL" --agree-tos
+                ;;
+                
+            4)
+                print_warning "Skipping Let's Encrypt, using self-signed"
+                return 1
+                ;;
+        esac
+    fi
+    
+    # Verify certificate was obtained
+    if [[ -d "$le_dir" ]] && [[ -f "${le_dir}/fullchain.pem" ]] && [[ -f "${le_dir}/privkey.pem" ]]; then
+        print_success "Let's Encrypt certificate obtained"
+        
+        # Combine for Pi-hole
+        if combine_certificates; then
+            print_success "Certificate installed for Pi-hole"
+            
+            # Show certificate info
+            local cert_expiry=$(openssl x509 -in "$PIHOLE_CERT" -enddate -noout | cut -d= -f2)
+            print_message "Certificate expires: $cert_expiry"
+            
+            return 0
         else
-            print_error "Failed to obtain certificate"
-            print_message "Falling back to self-signed certificate"
+            print_error "Failed to combine certificate for Pi-hole"
             return 1
         fi
-    fi
-    
-    # Combine certificate for Pi-hole
-    if [[ -f "${le_dir}/fullchain.pem" ]] && [[ -f "${le_dir}/privkey.pem" ]]; then
-        cat "${le_dir}/fullchain.pem" "${le_dir}/privkey.pem" > "$PIHOLE_CERT"
-        chown pihole:pihole "$PIHOLE_CERT"
-        chmod 600 "$PIHOLE_CERT"
-        print_success "Certificate installed at: $PIHOLE_CERT"
     else
-        print_error "Certificate files not found"
+        print_error "Failed to obtain Let's Encrypt certificate"
         return 1
     fi
-    
-    pause
 }
 
 #================================================================================
@@ -937,16 +1137,23 @@ setup_renewal() {
     
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
     
-    cat > "$RENEWAL_HOOK" << EOF
+    cat > "$RENEWAL_HOOK" << 'EOF'
 #!/bin/bash
-DOMAIN="\$RENEWED_DOMAINS"
-[ -z "\$DOMAIN" ] && DOMAIN="$DOMAIN"
+DOMAIN="$RENEWED_DOMAINS"
+PIHOLE_CERT="/etc/pihole/tls.pem"
 
-if [ -d "/etc/letsencrypt/live/\$DOMAIN" ]; then
-    cat "/etc/letsencrypt/live/\$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/\$DOMAIN/privkey.pem" > "$PIHOLE_CERT"
+if [ -z "$DOMAIN" ] && [ -f "/etc/pihole/encryption-installed.state" ]; then
+    source /etc/pihole/encryption-installed.state
+    DOMAIN="$INSTALLED_DOMAIN"
+fi
+
+if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+    echo "$(date): Renewing certificate for $DOMAIN" >> /var/log/pihole-cert-renewal.log
+    cat "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/$DOMAIN/privkey.pem" > "$PIHOLE_CERT"
     chown pihole:pihole "$PIHOLE_CERT" 2>/dev/null || true
-    systemctl reload pihole-FTL || systemctl restart pihole-FTL
-    logger "Pi-hole: Certificate renewed for \$DOMAIN"
+    chmod 600 "$PIHOLE_CERT"
+    systemctl reload pihole-FTL 2>/dev/null || systemctl restart pihole-FTL
+    echo "$(date): Certificate renewed and Pi-hole reloaded" >> /var/log/pihole-cert-renewal.log
 fi
 EOF
     
@@ -955,6 +1162,12 @@ EOF
     # Test renewal
     print_message "Testing renewal hook..."
     certbot renew --dry-run >> "$LOG_FILE" 2>&1 || true
+    
+    # Setup daily cron check (in case certbot timer fails)
+    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+        (crontab -l 2>/dev/null; echo "0 3 * * * /usr/bin/certbot renew --quiet --deploy-hook $RENEWAL_HOOK") | crontab -
+        print_success "Added daily renewal check to cron"
+    fi
     
     print_success "Auto-renewal configured"
     pause
@@ -997,6 +1210,9 @@ uninstall() {
     
     # Remove renewal hook
     [[ -f "$RENEWAL_HOOK" ]] && rm "$RENEWAL_HOOK"
+    
+    # Remove cron job
+    crontab -l 2>/dev/null | grep -v "certbot renew" | crontab -
     
     # Remove state file
     [[ -f "$INSTALL_STATE_FILE" ]] && rm "$INSTALL_STATE_FILE"
@@ -1049,7 +1265,7 @@ main_install() {
     
     # Step 6: Get Let's Encrypt certificate
     obtain_letsencrypt_cert || {
-        print_warning "Using self-signed certificate (Let's Encrypt failed)"
+        print_warning "Using self-signed certificate (Let's Encrypt skipped or failed)"
     }
     
     # Step 7: Configure Pi-hole

@@ -4,16 +4,17 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.3.4
+# Version: 1.3.5
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.3.4 - REMOVED: Interactive webroot ownership step (user confirmed it's already correct)
-#        ✅ CLEANER: No unnecessary prompts
-#        ✅ STREAMLINED: Faster installation
+# v1.3.5 - STREAMLINED: Removed self-signed cert generation and final HTTPS validation
+#        ✅ DIRECT: Goes straight to Let's Encrypt after port verification
+#        ✅ CLEANER: No unnecessary steps
+#        ✅ FASTER: Only what's needed
 #
 #############################################################################################################################
 
@@ -28,7 +29,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PU
 DOMAIN=""; EMAIL=""; WEB_PORT="443"; DNS_TLS_PORT="853"; LOCAL_IP=""
 PIHOLE_CERT="/etc/pihole/tls.pem"; PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"; PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="/var/log/pihole-encryption-setup.log"; SCRIPT_VERSION="1.3.4"
+LOG_FILE="/var/log/pihole-encryption-setup.log"; SCRIPT_VERSION="1.3.5"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"; WEBROOT="/var/www/html"
 
@@ -204,7 +205,6 @@ verify_port_80_accessible() {
     if ! ss -tlnp 2>/dev/null | grep -q ":80 "; then print_error "Port 80 not listening locally."; return 1; fi
     find "$WEBROOT" -name "acme-test-*.html" -type f -delete 2>/dev/null
     echo "ACME Test $(date)" > "$WEBROOT/$test_file"; chmod 644 "$WEBROOT/$test_file"
-    # Ensure correct ownership (pihole user) but don't prompt
     chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null || sudo chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null
     if ! curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1/$test_file" | grep -q "200"; then
         print_warning "⚠ Test file not accessible locally."; ls -la "$WEBROOT"; rm -f "$WEBROOT/$test_file"; return 1
@@ -223,27 +223,18 @@ verify_port_80_accessible() {
     else
         print_error "✗ Could not access test file from the internet."
         echo ""; echo "Please ensure:"; echo "  1) Port 80 is forwarded to $LOCAL_IP"; echo "  2) Your domain $DOMAIN points to $public_ip"; echo "  3) No firewall blocks port 80"; echo ""
-        echo "Options:"; echo "  1) Continue with self-signed certificate only"; echo "  2) Exit to troubleshoot"
+        echo "Options:"; echo "  1) Continue with self-signed certificate only (not recommended)"; echo "  2) Exit to troubleshoot"
         read -p "Choose (1-2): " choice
-        if [[ "$choice" == "1" ]]; then return 2; else exit 1; fi
+        if [[ "$choice" == "1" ]]; then
+            print_warning "Self-signed certificate will be used, but Let's Encrypt may not work."
+            return 2
+        else
+            exit 1
+        fi
     fi
 }
 
-# --- Certificate Functions ---
-generate_self_signed_cert() {
-    print_step "Generating Temporary Self-Signed Certificate"
-    print_message "Setting domain and triggering cert generation for: $DOMAIN"
-    set_toml_value "$PIHOLE_CONFIG" "webserver" "domain" "\"$DOMAIN\"" || return 1
-    rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
-    restart_pihole_with_verification || return 1; sleep 5
-    if [[ ! -f "$PIHOLE_CERT" ]] || [[ ! -s "$PIHOLE_CERT" ]]; then
-        print_error "Certificate generation failed."; ls -la /etc/pihole/tls*; return 1
-    fi
-    chown pihole:pihole "$PIHOLE_CERT" "$PIHOLE_CA_CERT" 2>/dev/null
-    chmod 600 "$PIHOLE_CERT"; chmod 644 "$PIHOLE_CA_CERT"
-    print_success "Self-signed certificate created at $PIHOLE_CERT"; pause
-}
-
+# --- Let's Encrypt Functions ---
 obtain_letsencrypt_http01() {
     print_step "Obtaining Let's Encrypt Certificate (HTTP-01)"
     local le_dir="/etc/letsencrypt/live/${DOMAIN}"
@@ -255,7 +246,9 @@ obtain_letsencrypt_http01() {
     if [[ -d "$le_dir" ]]; then
         print_warning "Certificate already exists for $DOMAIN."
         read -p "Renew it? (y/n): " -n 1 -r; echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then certbot renew --webroot -w "$WEBROOT" --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1 || return 1; fi
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            certbot renew --webroot -w "$WEBROOT" --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1 || return 1
+        fi
     else
         print_message "Requesting new certificate..."
         if ! certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
@@ -270,21 +263,6 @@ obtain_letsencrypt_http01() {
     else
         print_error "Certificate files not found after obtaining."; return 1
     fi
-}
-
-# --- HTTPS Validation ---
-validate_https() {
-    print_step "Final Validation: Testing HTTPS"
-    local max_attempts=10; local attempt=1; local success=false
-    print_message "Testing https://127.0.0.1:$WEB_PORT/admin ..."
-    while [[ $attempt -le $max_attempts ]] && [[ "$success" == false ]]; do
-        if curl -k -s -o /dev/null -w "%{http_code}" "https://127.0.0.1:$WEB_PORT/admin" 2>/dev/null | grep -q "200\|302"; then
-            success=true; break
-        fi
-        sleep 2; ((attempt++))
-    done
-    if [[ "$success" == true ]]; then print_success "✓ HTTPS validation passed."; return 0
-    else print_error "✗ HTTPS validation failed."; return 1; fi
 }
 
 # --- Pi-hole Configuration ---
@@ -367,21 +345,24 @@ main_install() {
         read -p "Continue anyway? (y/n): " -n 1 -r; echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
     fi
+
     create_backup
     verify_pihole_config
-    # Webroot ownership step removed as per user request (already correct)
     verify_port_80_accessible; local port_status=$?
-    generate_self_signed_cert || exit 1
-    validate_https || exit 1
+
     if [[ $port_status -eq 0 ]]; then
-        obtain_letsencrypt_http01 || print_warning "Let's Encrypt failed. Using self-signed cert."
+        # Directly obtain Let's Encrypt certificate
+        obtain_letsencrypt_http01 || { print_error "Let's Encrypt failed."; exit 1; }
     else
-        print_warning "Port 80 test failed. Using self-signed certificate."
+        print_error "Port 80 test failed. Cannot obtain Let's Encrypt certificate."
+        exit 1
     fi
+
     configure_pihole
     restart_pihole_with_verification || exit 1
-    validate_https || exit 1
+
     setup_renewal
+
     echo ""; print_success "🎉 Installation Complete!"
     echo -e "${GREEN}Access Pi-hole admin:${NC} https://$DOMAIN:$WEB_PORT/admin"
     echo -e "${GREEN}Backup location:${NC} $BACKUP_DIR"
@@ -409,7 +390,7 @@ show_menu() {
         echo -e "${YELLOW}Existing installation detected:${NC}"
         echo "  Domain: $DOMAIN"; echo "  Web Port: $WEB_PORT"; echo "  Installed: $INSTALL_DATE"; echo ""
     fi
-    echo "Main Menu:"; echo "  1) Fresh Install"; echo "  2) Uninstall"; echo "  3) Exit"; echo ""
+    echo "Main Menu:"; echo "  1) Fresh Install (Let's Encrypt)"; echo "  2) Uninstall"; echo "  3) Exit"; echo ""
     read -p "Choose option (1-3): " menu_choice
     case $menu_choice in
         1)

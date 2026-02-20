@@ -4,17 +4,19 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.3.5
+# Version: 1.3.6
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.3.5 - STREAMLINED: Removed self-signed cert generation and final HTTPS validation
-#        ✅ DIRECT: Goes straight to Let's Encrypt after port verification
-#        ✅ CLEANER: No unnecessary steps
-#        ✅ FASTER: Only what's needed
+# v1.3.6 - HARDENED: Let's Encrypt with comprehensive diagnostics
+#        ✅ PRE-FLIGHT: Checks for port 80 conflicts (apache2, lighttpd, nginx)
+#        ✅ PERMISSIONS: Ensures certificate is readable by pihole user
+#        ✅ DNS VERIFICATION: Confirms domain resolves to public IP
+#        ✅ CLEAR LOGGING: Full certbot output captured and displayed on failure
+#        ✅ FALLBACK: Option to generate self-signed cert if Let's Encrypt fails
 #
 #############################################################################################################################
 
@@ -29,9 +31,12 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PU
 DOMAIN=""; EMAIL=""; WEB_PORT="443"; DNS_TLS_PORT="853"; LOCAL_IP=""
 PIHOLE_CERT="/etc/pihole/tls.pem"; PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"; PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="/var/log/pihole-encryption-setup.log"; SCRIPT_VERSION="1.3.5"
+LOG_FILE="/var/log/pihole-encryption-setup.log"; SCRIPT_VERSION="1.3.6"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"; WEBROOT="/var/www/html"
+
+# --- Ensure log file exists and is writable ---
+touch "$LOG_FILE" 2>/dev/null || { echo "Cannot write to $LOG_FILE"; exit 1; }
 
 # --- Error Handling ---
 trap 'error_handler $? $LINENO $BASH_COMMAND' ERR
@@ -196,37 +201,118 @@ verify_pihole_config() {
     echo ""; print_message "Current [webserver] section:"; sed -n '/^\[webserver\]/,/^\[/p' "$config_file" | head -10; echo ""; pause
 }
 
-# --- Port 80 Verification ---
+# --- Port 80 Conflict Check ---
+check_port_80_conflicts() {
+    print_step "Checking for Port 80 Conflicts"
+    local conflicts=false
+    for service in apache2 lighttpd nginx httpd; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            print_warning "  Service '$service' is running and may be using port 80."
+            conflicts=true
+        fi
+    done
+    if [[ "$conflicts" == true ]]; then
+        echo ""
+        print_message "Options:"
+        echo "  1) Stop conflicting services automatically (recommended)"
+        echo "  2) Continue anyway (may cause Let's Encrypt failure)"
+        echo "  3) Exit and fix manually"
+        read -p "Choose option (1-3): " conflict_choice
+        case $conflict_choice in
+            1)
+                for service in apache2 lighttpd nginx httpd; do
+                    if systemctl is-active --quiet "$service" 2>/dev/null; then
+                        print_message "Stopping $service..."
+                        systemctl stop "$service"
+                        systemctl disable "$service" 2>/dev/null
+                    fi
+                done
+                print_success "Conflicting services stopped."
+                ;;
+            2)
+                print_warning "Continuing with potential conflicts."
+                ;;
+            3)
+                exit 1
+                ;;
+        esac
+    else
+        print_success "✓ No obvious port 80 conflicts detected."
+    fi
+    pause
+}
+
+# --- Port 80 Accessibility Test ---
 verify_port_80_accessible() {
     print_step "Verifying External Access on Port 80"
     local public_ip=$(curl -s ifconfig.me 2>/dev/null || echo "unknown")
     local test_file="acme-test-$(date +%s).html"; local test_url="http://$DOMAIN/$test_file"
-    print_message "Your public IP: $public_ip"; print_message "Your domain '$DOMAIN' should have an A record pointing to this IP."; echo ""
-    if ! ss -tlnp 2>/dev/null | grep -q ":80 "; then print_error "Port 80 not listening locally."; return 1; fi
-    find "$WEBROOT" -name "acme-test-*.html" -type f -delete 2>/dev/null
-    echo "ACME Test $(date)" > "$WEBROOT/$test_file"; chmod 644 "$WEBROOT/$test_file"
-    chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null || sudo chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null
-    if ! curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1/$test_file" | grep -q "200"; then
-        print_warning "⚠ Test file not accessible locally."; ls -la "$WEBROOT"; rm -f "$WEBROOT/$test_file"; return 1
+    print_message "Your public IP: $public_ip"
+    print_message "Your domain '$DOMAIN' should have an A record pointing to this IP."
+    echo ""
+
+    # First check if port 80 is listening
+    if ! ss -tlnp 2>/dev/null | grep -q ":80 "; then
+        print_error "Port 80 is not listening locally. Cannot proceed with HTTP-01 challenge."
+        return 1
     fi
-    print_message "Testing external access to $test_url... (This may take a moment)"; local test_success=false
+
+    # Check if domain resolves to the public IP
+    local domain_ip=$(dig +short "$DOMAIN" @8.8.8.8 2>/dev/null | head -1)
+    if [[ -n "$domain_ip" && "$domain_ip" != "$public_ip" ]]; then
+        print_warning "  Domain $DOMAIN resolves to $domain_ip, but your public IP is $public_ip."
+        print_warning "  This will cause Let's Encrypt to fail. Please update your DNS A record."
+        read -p "Continue anyway? (y/n): " -n 1 -r; echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    fi
+
+    # Create test file
+    find "$WEBROOT" -name "acme-test-*.html" -type f -delete 2>/dev/null
+    echo "ACME Test $(date)" > "$WEBROOT/$test_file"
+    chmod 644 "$WEBROOT/$test_file"
+    chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null || sudo chown pihole:pihole "$WEBROOT/$test_file" 2>/dev/null
+
+    # Local test
+    if ! curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1/$test_file" | grep -q "200"; then
+        print_error "Test file not accessible locally. Check webroot and configuration."
+        ls -la "$WEBROOT"
+        rm -f "$WEBROOT/$test_file"
+        return 1
+    fi
+
+    # External test
+    print_message "Testing external access to $test_url... (This may take a moment)"
+    local test_success=false
     for ((i=1; i<=3; i++)); do
         echo -n "  Attempt $i: "
         if timeout 10 curl -s -o /dev/null -w "%{http_code}" "$test_url" 2>/dev/null | grep -q "200"; then
-            echo -e "${GREEN}OK${NC}"; test_success=true; break
+            echo -e "${GREEN}OK${NC}"
+            test_success=true
+            break
         fi
         echo -e "${YELLOW}Failed${NC}"; sleep 2
     done
+
     rm -f "$WEBROOT/$test_file"
+
     if [[ "$test_success" == true ]]; then
-        print_success "✓ Port 80 is externally accessible! Ready for Let's Encrypt."; return 0
+        print_success "✓ Port 80 is externally accessible! Ready for Let's Encrypt."
+        return 0
     else
         print_error "✗ Could not access test file from the internet."
-        echo ""; echo "Please ensure:"; echo "  1) Port 80 is forwarded to $LOCAL_IP"; echo "  2) Your domain $DOMAIN points to $public_ip"; echo "  3) No firewall blocks port 80"; echo ""
-        echo "Options:"; echo "  1) Continue with self-signed certificate only (not recommended)"; echo "  2) Exit to troubleshoot"
+        echo ""
+        echo "Please ensure:"
+        echo "  1) Port 80 is forwarded to $LOCAL_IP"
+        echo "  2) Your domain $DOMAIN points to $public_ip"
+        echo "  3) No firewall blocks port 80"
+        echo ""
+        echo "Options:"
+        echo "  1) Continue with self-signed certificate only (not recommended)"
+        echo "  2) Exit to troubleshoot"
         read -p "Choose (1-2): " choice
         if [[ "$choice" == "1" ]]; then
-            print_warning "Self-signed certificate will be used, but Let's Encrypt may not work."
             return 2
         else
             exit 1
@@ -234,34 +320,98 @@ verify_port_80_accessible() {
     fi
 }
 
-# --- Let's Encrypt Functions ---
+# --- Self-signed fallback ---
+generate_self_signed_cert() {
+    print_step "Generating Self-Signed Certificate (Fallback)"
+    print_message "Setting domain and triggering cert generation for: $DOMAIN"
+    set_toml_value "$PIHOLE_CONFIG" "webserver" "domain" "\"$DOMAIN\"" || return 1
+    rm -f /etc/pihole/tls* >> "$LOG_FILE" 2>&1
+    restart_pihole_with_verification || return 1
+    sleep 5
+    if [[ ! -f "$PIHOLE_CERT" ]] || [[ ! -s "$PIHOLE_CERT" ]]; then
+        print_error "Self-signed certificate generation failed."
+        return 1
+    fi
+    chown pihole:pihole "$PIHOLE_CERT" "$PIHOLE_CA_CERT" 2>/dev/null
+    chmod 600 "$PIHOLE_CERT"; chmod 644 "$PIHOLE_CA_CERT"
+    print_success "Self-signed certificate created at $PIHOLE_CERT"
+    pause
+}
+
+# --- Let's Encrypt with enhanced diagnostics ---
 obtain_letsencrypt_http01() {
     print_step "Obtaining Let's Encrypt Certificate (HTTP-01)"
     local le_dir="/etc/letsencrypt/live/${DOMAIN}"
+    local certbot_output
+    local certbot_status
+
     if ! command -v certbot &> /dev/null; then
         print_message "Installing certbot..."
         apt-get update &>/dev/null && apt-get install -y certbot &>/dev/null || { print_error "Failed to install certbot."; return 1; }
     fi
-    mkdir -p "$WEBROOT"; chown pihole:pihole "$WEBROOT" 2>/dev/null || true
+
+    mkdir -p "$WEBROOT"
+    chown pihole:pihole "$WEBROOT" 2>/dev/null || true
+
     if [[ -d "$le_dir" ]]; then
         print_warning "Certificate already exists for $DOMAIN."
         read -p "Renew it? (y/n): " -n 1 -r; echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            certbot renew --webroot -w "$WEBROOT" --cert-name "$DOMAIN" >> "$LOG_FILE" 2>&1 || return 1
+            certbot_output=$(certbot renew --webroot -w "$WEBROOT" --cert-name "$DOMAIN" 2>&1)
+            certbot_status=$?
+            echo "$certbot_output" >> "$LOG_FILE"
+            if [[ $certbot_status -ne 0 ]]; then
+                print_error "Renewal failed. Last 20 lines of output:"
+                echo "$certbot_output" | tail -20
+                return 1
+            fi
         fi
     else
         print_message "Requesting new certificate..."
-        if ! certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" >> "$LOG_FILE" 2>&1; then
-            print_error "Let's Encrypt challenge failed. Check $LOG_FILE."; return 1
+        certbot_output=$(certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos --email "$EMAIL" -d "$DOMAIN" 2>&1)
+        certbot_status=$?
+        echo "$certbot_output" >> "$LOG_FILE"
+        if [[ $certbot_status -ne 0 ]]; then
+            print_error "Let's Encrypt challenge failed. Last 20 lines of output:"
+            echo "$certbot_output" | tail -20
+            echo ""
+            print_message "Full log available at: $LOG_FILE"
+            print_message "Common reasons for failure:"
+            echo "  • Domain $DOMAIN does not resolve to your public IP ($(curl -s ifconfig.me 2>/dev/null))"
+            echo "  • Port 80 is not accessible from the internet (firewall/NAT issue)"
+            echo "  • A web server is already using port 80 (should be Pi-hole)"
+            echo "  • Your ISP blocks port 80"
+            echo ""
+            read -p "Would you like to continue with a self-signed certificate instead? (y/n): " -n 1 -r; echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                generate_self_signed_cert
+                return 2  # Special code for fallback
+            else
+                return 1
+            fi
         fi
     fi
+
+    # Verify certificate files exist and are readable
     if [[ -f "${le_dir}/fullchain.pem" ]] && [[ -f "${le_dir}/privkey.pem" ]]; then
-        cat "${le_dir}/fullchain.pem" "${le_dir}/privkey.pem" > "$PIHOLE_CERT"
-        chown pihole:pihole "$PIHOLE_CERT"; chmod 600 "$PIHOLE_CERT"
-        local expiry=$(openssl x509 -in "$PIHOLE_CERT" -enddate -noout | cut -d= -f2)
-        print_success "Certificate obtained and installed. Expires: $expiry"; return 0
+        # Combine in the correct order (private key + certificate chain)
+        cat "${le_dir}/privkey.pem" "${le_dir}/fullchain.pem" > "$PIHOLE_CERT"
+        chown pihole:pihole "$PIHOLE_CERT"
+        chmod 600 "$PIHOLE_CERT"
+
+        # Verify the combined certificate
+        if openssl x509 -in "$PIHOLE_CERT" -noout 2>/dev/null; then
+            local expiry=$(openssl x509 -in "$PIHOLE_CERT" -enddate -noout | cut -d= -f2)
+            print_success "Certificate obtained and installed. Expires: $expiry"
+            return 0
+        else
+            print_error "Combined certificate is invalid. Check order and content."
+            return 1
+        fi
     else
-        print_error "Certificate files not found after obtaining."; return 1
+        print_error "Certificate files not found after obtaining."
+        ls -la "${le_dir}/" || true
+        return 1
     fi
 }
 
@@ -301,7 +451,7 @@ PIHOLE_CERT="$PIHOLE_CERT"
 WEBROOT="$WEBROOT"
 if [ -z "\$DOMAIN" ] && [ -f "$INSTALL_STATE_FILE" ]; then source "$INSTALL_STATE_FILE"; DOMAIN="\$DOMAIN"; fi
 if [ -d "/etc/letsencrypt/live/\$DOMAIN" ]; then
-    cat "/etc/letsencrypt/live/\$DOMAIN/fullchain.pem" "/etc/letsencrypt/live/\$DOMAIN/privkey.pem" > "\$PIHOLE_CERT"
+    cat "/etc/letsencrypt/live/\$DOMAIN/privkey.pem" "/etc/letsencrypt/live/\$DOMAIN/fullchain.pem" > "\$PIHOLE_CERT"
     chown pihole:pihole "\$PIHOLE_CERT" 2>/dev/null || true; chmod 600 "\$PIHOLE_CERT"
     systemctl reload pihole-FTL 2>/dev/null || systemctl restart pihole-FTL
 fi
@@ -339,28 +489,33 @@ main_install() {
     read -p "Enter your domain (e.g., dns.example.com): " DOMAIN; DOMAIN=$(echo "$DOMAIN" | xargs)
     read -p "Enter your email for Let's Encrypt: " EMAIL; EMAIL=$(echo "$EMAIL" | xargs)
     LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -1)
-    local domain_ip=$(dig +short "$DOMAIN" @8.8.8.8 2>/dev/null | head -1)
-    if [[ -n "$domain_ip" && "$domain_ip" != "$LOCAL_IP" ]]; then
-        print_warning "Domain $DOMAIN resolves to $domain_ip, but server IP is $LOCAL_IP."
-        read -p "Continue anyway? (y/n): " -n 1 -r; echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 0; fi
-    fi
 
     create_backup
     verify_pihole_config
+    check_port_80_conflicts
     verify_port_80_accessible; local port_status=$?
 
     if [[ $port_status -eq 0 ]]; then
-        # Directly obtain Let's Encrypt certificate
-        obtain_letsencrypt_http01 || { print_error "Let's Encrypt failed."; exit 1; }
+        obtain_letsencrypt_http01; local le_status=$?
+        if [[ $le_status -eq 2 ]]; then
+            # Fallback to self-signed already happened
+            :
+        elif [[ $le_status -ne 0 ]]; then
+            print_error "Let's Encrypt failed and no fallback was chosen. Exiting."
+            exit 1
+        fi
     else
         print_error "Port 80 test failed. Cannot obtain Let's Encrypt certificate."
-        exit 1
+        read -p "Generate a self-signed certificate instead? (y/n): " -n 1 -r; echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            generate_self_signed_cert || exit 1
+        else
+            exit 1
+        fi
     fi
 
     configure_pihole
     restart_pihole_with_verification || exit 1
-
     setup_renewal
 
     echo ""; print_success "🎉 Installation Complete!"

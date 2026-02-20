@@ -4,19 +4,18 @@
 #
 # Wael Isa
 # Build Date: 02/20/2026
-# Version: 1.2.5
+# Version: 1.2.6
 # GitHub: https://github.com/waelisa/pihole-encryption
 # Website: https://www.wael.name/
 # Support: https://www.paypal.me/WaelIsa
 #
 #############################################################################################################################
 #
-# v1.2.5 - FIXED: Webroot permissions for Pi-hole v6.5
-#        ✅ FIXED: Parent directory permissions (/, /var, /var/www need o+x)
-#        ✅ ADDED: Permission diagnostics before test file creation
-#        ✅ ADDED: Automatic permission fixing with user confirmation
-#        ✅ ADDED: Option to change ownership to pihole user
-#        ✅ VERIFIED: Based on official Pi-hole forum solutions
+# v1.2.6 - FIXED: Function name consistency and backup restoration
+#        ✅ FIXED: create_backup function now properly called
+#        ✅ ADDED: Better handling of existing installations
+#        ✅ FIXED: Restore function now works with backup directory
+#        ✅ IMPROVED: Menu flow for reinstallations
 #
 #############################################################################################################################
 
@@ -45,7 +44,7 @@ PIHOLE_CA_CERT="/etc/pihole/tls_ca.crt"
 PIHOLE_CONFIG="/etc/pihole/pihole.toml"
 BACKUP_DIR="/root/pihole-encryption-backup-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/pihole-encryption-setup.log"
-SCRIPT_VERSION="1.2.5"
+SCRIPT_VERSION="1.2.6"
 INSTALL_STATE_FILE="/etc/pihole/encryption-installed.state"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/pihole.sh"
 WEBROOT="/var/www/html"
@@ -105,7 +104,114 @@ print_error() {
 }
 
 #================================================================================
-# PERMISSION DIAGNOSTICS AND FIX (NEW in v1.2.5)
+# BACKUP FUNCTIONS
+#================================================================================
+
+create_backup() {
+    print_step "Creating Comprehensive Backup"
+    print_message "Backup location: $BACKUP_DIR"
+    
+    mkdir -p "$BACKUP_DIR"
+    
+    # Backup Pi-hole configuration
+    if [[ -f "$PIHOLE_CONFIG" ]]; then
+        cp "$PIHOLE_CONFIG" "$BACKUP_DIR/pihole.toml.backup"
+        print_message "✓ Backed up Pi-hole config"
+    fi
+    
+    # Backup certificates
+    if [[ -f "$PIHOLE_CERT" ]]; then
+        cp "$PIHOLE_CERT" "$BACKUP_DIR/tls.pem.backup"
+        print_message "✓ Backed up TLS certificate"
+    fi
+    
+    if [[ -f "$PIHOLE_CA_CERT" ]]; then
+        cp "$PIHOLE_CA_CERT" "$BACKUP_DIR/tls_ca.crt.backup"
+        print_message "✓ Backed up CA certificate"
+    fi
+    
+    # Backup Let's Encrypt if exists
+    if [[ -d "/etc/letsencrypt" ]]; then
+        cp -r "/etc/letsencrypt" "$BACKUP_DIR/letsencrypt.backup" 2>/dev/null || true
+        print_message "✓ Backed up Let's Encrypt"
+    fi
+    
+    # Create restore script
+    cat > "$BACKUP_DIR/restore.sh" << 'EOF'
+#!/bin/bash
+echo "Restoring Pi-hole from backup..."
+echo "Backup directory: $(pwd)"
+
+# Stop Pi-hole first
+systemctl stop pihole-FTL
+sleep 3
+pkill -f pihole-FTL 2>/dev/null || true
+sleep 2
+
+# Restore config
+if [[ -f "pihole.toml.backup" ]]; then
+    cp pihole.toml.backup /etc/pihole/pihole.toml
+    echo "✓ Restored Pi-hole config"
+fi
+
+# Restore certificates
+if [[ -f "tls.pem.backup" ]]; then
+    cp tls.pem.backup /etc/pihole/tls.pem
+    chown pihole:pihole /etc/pihole/tls.pem 2>/dev/null
+    chmod 600 /etc/pihole/tls.pem
+    echo "✓ Restored TLS certificate"
+fi
+
+if [[ -f "tls_ca.crt.backup" ]]; then
+    cp tls_ca.crt.backup /etc/pihole/tls_ca.crt
+    chown pihole:pihole /etc/pihole/tls_ca.crt 2>/dev/null
+    chmod 644 /etc/pihole/tls_ca.crt
+    echo "✓ Restored CA certificate"
+fi
+
+# Restart Pi-hole
+systemctl start pihole-FTL
+sleep 5
+
+# Verify restore
+if systemctl is-active --quiet pihole-FTL; then
+    echo "✓ Pi-hole FTL is running"
+    echo ""
+    echo "Testing HTTPS..."
+    curl -k https://localhost:443/admin/ -I
+else
+    echo "⚠ Pi-hole FTL failed to start"
+    systemctl status pihole-FTL --no-pager
+fi
+EOF
+    
+    chmod +x "$BACKUP_DIR/restore.sh"
+    
+    print_success "✓ Backup completed"
+    pause
+}
+
+restore_from_backup() {
+    print_step "Restoring from Backup"
+    
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        print_error "Backup directory not found: $BACKUP_DIR"
+        return 1
+    fi
+    
+    if [[ -f "$BACKUP_DIR/restore.sh" ]]; then
+        bash "$BACKUP_DIR/restore.sh"
+        print_success "Restore completed"
+    else
+        print_error "Restore script not found"
+        return 1
+    fi
+    
+    pause
+}
+
+#================================================================================
+# PERMISSION DIAGNOSTICS
 #================================================================================
 
 check_webroot_permissions() {
@@ -131,7 +237,6 @@ check_webroot_permissions() {
             echo -e "  $path: $perms (owner: $owner, group: $group)"
             
             # Check if 'other' has execute permission (needed for pihole user to traverse)
-            # Permission format: 755 means other has 5 = read+execute
             local other_perms=$(( ${perms:2:1} ))
             
             if [[ "$path" == "/" ]]; then
@@ -162,7 +267,7 @@ check_webroot_permissions() {
     echo ""
     
     if [[ "$issues_found" == true ]]; then
-        print_warning "Permission issues detected that may prevent Let's Encrypt from working [citation:1]"
+        print_warning "Permission issues detected that may prevent Let's Encrypt from working"
         echo ""
         echo "According to Pi-hole documentation, the pihole user needs:"
         echo "  • Execute (traverse) permission on all parent directories"
@@ -205,7 +310,7 @@ check_webroot_permissions() {
 }
 
 #================================================================================
-# PORT 80 VERIFICATION (UPDATED with permission check)
+# PORT 80 VERIFICATION
 #================================================================================
 
 verify_port_80_accessible() {
@@ -343,7 +448,7 @@ verify_port_80_accessible() {
         echo "  1. Port 80 is forwarded on your router to $LOCAL_IP"
         echo "  2. Your domain $DOMAIN points to $public_ip"
         echo "  3. No firewall is blocking port 80"
-        echo "  4. Directory permissions allow the pihole user to read files [citation:1]"
+        echo "  4. Directory permissions allow the pihole user to read files"
         echo ""
         print_message "You can test locally with: curl http://127.0.0.1/"
         print_message "You can test from outside with: curl http://$DOMAIN/"
@@ -558,7 +663,20 @@ show_menu() {
     read -p "Choose option (1-4): " menu_choice
     
     case $menu_choice in
-        1) ;;
+        1) 
+            if [[ -f "$INSTALL_STATE_FILE" ]]; then
+                echo ""
+                print_warning "This will overwrite your existing installation"
+                print_warning "A backup will be created before making changes"
+                read -p "Continue with fresh install? (y/n): " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    show_menu
+                    return
+                fi
+            fi
+            # Continue with install
+            ;;
         2) restore_menu ;;
         3) uninstall; exit 0 ;;
         4) exit 0 ;;
@@ -572,7 +690,7 @@ restore_menu() {
     local backups=($(ls -d /root/pihole-encryption-backup-* 2>/dev/null | sort -r))
     
     if [[ ${#backups[@]} -eq 0 ]]; then
-        print_error "No backups found"
+        print_error "No backups found in /root/"
         pause
         show_menu
         return
@@ -582,24 +700,33 @@ restore_menu() {
     local i=1
     for backup in "${backups[@]}"; do
         echo "  $i) $(basename "$backup")"
+        if [[ -f "$backup/restore.sh" ]]; then
+            echo "     (has restore script)"
+        fi
         ((i++))
     done
     echo "  $i) Back to main menu"
     echo ""
     
-    read -p "Choose backup (1-${i}): " choice
+    read -p "Choose backup to restore (1-${i}): " backup_choice
     
-    if [[ "$choice" -eq $i ]]; then
+    if [[ "$backup_choice" -eq $i ]]; then
         show_menu
         return
     fi
     
-    if [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#backups[@]} ]]; then
-        local selected="${backups[$((choice-1))]}"
+    if [[ "$backup_choice" -ge 1 ]] && [[ "$backup_choice" -le ${#backups[@]} ]]; then
+        local selected="${backups[$((backup_choice-1))]}"
+        print_message "Restoring from: $selected"
+        
         if [[ -f "$selected/restore.sh" ]]; then
             bash "$selected/restore.sh"
             print_success "Restore completed"
+        else
+            print_error "Restore script not found in backup"
         fi
+    else
+        print_error "Invalid choice"
     fi
     
     pause
@@ -881,7 +1008,7 @@ uninstall() {
     print_step "Uninstalling Encryption"
     
     echo -e "${YELLOW}What would you like to do?${NC}"
-    echo "  1) Restore original (no HTTPS)"
+    echo "  1) Restore original (no HTTPS, port 80 only)"
     echo "  2) Keep self-signed certificate"
     echo "  3) Keep Let's Encrypt"
     read -p "Choose (1-3): " choice
@@ -894,11 +1021,14 @@ uninstall() {
             set_pihole_config "dns.doq.enabled" "false"
             set_pihole_config "dns.doh.enabled" "false"
             rm -f "$PIHOLE_CERT" "$PIHOLE_CA_CERT" 2>/dev/null
+            print_success "HTTPS disabled, port 80 restored"
             ;;
         2)
             set_pihole_config "webserver.port" "$WEB_PORT"
+            print_success "Keeping self-signed certificate"
             ;;
         3)
+            print_success "Keeping Let's Encrypt certificate"
             ;;
     esac
     
@@ -918,6 +1048,7 @@ uninstall() {
 main_install() {
     print_step "Starting Installation"
     
+    # Create backup first
     create_backup
     
     prompt_domain
@@ -971,6 +1102,14 @@ main_install() {
 main() {
     case $1 in
         --uninstall) uninstall; exit 0 ;;
+        --restore)
+            if [[ -d "$2" ]]; then
+                bash "$2/restore.sh"
+            else
+                print_error "Please specify backup directory"
+            fi
+            exit 0
+            ;;
         --help)
             echo "Pi-hole Encryption Setup v$SCRIPT_VERSION"
             echo "Usage: $0 [OPTIONS]"
@@ -988,6 +1127,7 @@ main() {
             ;;
     esac
     
+    check_root
     show_menu
     main_install
 }
